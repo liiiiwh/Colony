@@ -28,6 +28,9 @@ _CACHE_TTL_DEFAULT = 60.0
 # 新建 Mission 未填「它要做什么」(goal_hint) 时，主动发给用户的固定问候语。
 # 这是 admin 可在「系统设置」编辑的 system_setting (key=mission.empty_goal_prompt)，
 # 非 LLM 生成；此常量是 DB 行缺失时的兜底默认值（create_mission 与 startup seed 共用）。
+# ADR-030 · shell 安全门提示词（后台「系统设置」可编辑；缺省回落 shell_judge.JUDGE_DEFAULT_SYSTEM_PROMPT）
+SHELL_JUDGE_PROMPT_KEY = "shell_judge.system_prompt"
+
 MISSION_EMPTY_GOAL_PROMPT_KEY = "mission.empty_goal_prompt"
 MISSION_EMPTY_GOAL_PROMPT_DEFAULT = (
     "你好 👋 这个助手已就绪。告诉我你想让我做什么，我就开始干。\n\n"

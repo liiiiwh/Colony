@@ -447,9 +447,12 @@ def agent_create_tool(ctx: BuiltinToolContext) -> StructuredTool:
                     create_kwargs["capability"] = capability
                 payload = AgentCreate(**create_kwargs)
                 agent = await agent_service.create_agent(db, payload)
-                # ADR-018 D3 · 1:1 provenance：记产出该 super 的 origin Builder mission，
-                # 供单-super 不变量复用 + super 自迭代/escalation 路由。
-                if (kind or "").lower() == "super" and ctx.mission_id is not None:
+                # ADR-018 D3 · 1:1 provenance：记产出该 agent 的 origin Builder mission。
+                # super：单-super 不变量复用 + escalation 路由。
+                # worker（2026-07-05）：完整性 gate 的确定性自修复要按「本 builder 会话建的
+                # 孤儿 worker」归集花名册——LLM 屡次无视 agent_update 声明指令（e2e 实证
+                # 三连拒），provenance 让 finalize 能代劳，不再赌 LLM 自觉。
+                if ctx.mission_id is not None:
                     agent.built_by_mission_id = ctx.mission_id
                     await db.commit()
                 return {
@@ -756,6 +759,8 @@ def mcp_server_register_tool(ctx: BuiltinToolContext) -> StructuredTool:
         command: list[str] | None = None,
         env_vars: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        startup_command: list[str] | None = None,
+        startup_cwd: str | None = None,
     ) -> dict:
         from app.schemas.skill import MCPServerCreate
         from app.services import skill_service
@@ -768,6 +773,21 @@ def mcp_server_register_tool(ctx: BuiltinToolContext) -> StructuredTool:
             return {"ok": False, "error": "server_type=http must provide url (e.g. http://localhost:18060/mcp)"}
         if server_type == "stdio" and not command:
             return {"ok": False, "error": "server_type=stdio must provide command (list[str])"}
+        # 修 mission-7a9afb：本地 http MCP（localhost/127.0.0.1）是要平台拉起的进程，**必须**带
+        # startup_command，否则平台无从 launch → readiness 假 ready → super 以为装好实则没装。
+        _is_local_http = server_type == "http" and (
+            "localhost" in (url or "") or "127.0.0.1" in (url or "")
+        )
+        if _is_local_http and not startup_command:
+            return {
+                "ok": False,
+                "error_code": "LOCAL_NEEDS_STARTUP_COMMAND",
+                "error": (
+                    f"本地 MCP（url={url}）必须带 startup_command，平台才能拉起该进程。"
+                    "正确流程：① request_approval 征得安装同意 → ② run_shell 按 SETUP 装好并确认可启动 → "
+                    "③ mcp_server_register(url=..., startup_command=[...], startup_cwd=...) → ④ mcp_ensure_ready。"
+                ),
+            }
         async with ctx.db_factory() as db:
             # 幂等：同 URL（http）/ 同 command（stdio）已存在就直接返回——
             # 否则每次 builder 跑都加一条 xiaohongshu-mcp / xiaohongshu-mcp-2 / xiaohongshu-mcp-v2 ...
@@ -803,6 +823,8 @@ def mcp_server_register_tool(ctx: BuiltinToolContext) -> StructuredTool:
                     command=command,
                     env_vars=env_vars,
                     headers=headers,
+                    startup_command=startup_command,
+                    startup_cwd=startup_cwd,
                 )
                 server = await skill_service.create_mcp_server(db, payload)
             except ValueError as exc:
@@ -829,9 +851,12 @@ def mcp_server_register_tool(ctx: BuiltinToolContext) -> StructuredTool:
             "Register an MCP server into the system. **Must be called after installing a ClawHub mcp-server / static-instruction type skill**: "
             "record the local (e.g. http://localhost:18060/mcp) or remote MCP service, "
             "then use agent_mcp_bind to bind it to the worker. "
+            "For a LOCAL http server (localhost/127.0.0.1) you **must** pass startup_command (+ startup_cwd) so the platform can launch the process; "
+            "otherwise it can never become ready (register is rejected with LOCAL_NEEDS_STARTUP_COMMAND). "
             "Params: name(str required, globally unique) / url(required in http mode) / "
             "server_type('http'|'stdio', default http) / description / command(required in stdio mode, list[str]) / "
-            "env_vars(dict optional) / headers(dict optional)."
+            "env_vars(dict optional) / headers(dict optional) / "
+            "startup_command(list[str], required for local http — how to launch the server, e.g. ['./xhs-mcp']) / startup_cwd(str optional)."
         ),
     )
 
@@ -1593,6 +1618,31 @@ def schedule_delete_tool(ctx: BuiltinToolContext) -> StructuredTool:
     )
 
 
+async def _recent_approved_decisions(db, mission_id, limit: int = 5) -> list[dict]:
+    """ADR-030 · 取本任务最近已决审批（DB 真实用户决定，可信）喂给 shell judge：
+    已批准的操作（如「授权安装 X MCP」→ 用户选「同意安装」）→ 判官据此放行对应 run_shell。
+    命令内的『已批准』辩解文字仍不可信（judge 提示词已区分）。"""
+    if mission_id is None:
+        return []
+    try:
+        from sqlalchemy import select as _select
+        from app.models.approvals import PendingApproval
+        rows = (await db.execute(
+            _select(PendingApproval)
+            .where(PendingApproval.mission_id == mission_id,
+                   PendingApproval.status == "decided")
+            .order_by(PendingApproval.decided_at.desc().nullslast())
+            .limit(limit)
+        )).scalars().all()
+        return [
+            {"title": r.title, "option": r.decided_option, "message": r.message}
+            for r in rows
+        ]
+    except Exception:  # noqa: BLE001 — 审批上下文取不到不应阻断 shell（judge 缺审批即按默认判）
+        logger.exception("[run_shell] 取审批上下文失败（不阻塞）mission=%s", mission_id)
+        return []
+
+
 def run_shell_tool(ctx: BuiltinToolContext) -> StructuredTool:
     """ADR-010 R3 · (Builder scope) general-purpose shell, executed after gatekeeping.
 
@@ -1612,11 +1662,25 @@ def run_shell_tool(ctx: BuiltinToolContext) -> StructuredTool:
         async with ctx.db_factory() as db:
             agent_id = (ctx.extra or {}).get("agent_id")
             agent = await db.get(Agent, uuid.UUID(str(agent_id))) if agent_id else None
-            if agent is None or not agent.model_id:
-                return {"ok": False, "error": "Cannot locate the initiating agent's model to construct the safety gate"}
-            model = await db.get(LLMModel, agent.model_id)
+            if agent is None:
+                return {"ok": False, "error": "Cannot locate the initiating agent to construct the safety gate"}
+            # 修 mission-2-3ecbf4：平台 Agent（Builder / mcp_installer 等）一律 model_id=NULL
+            # （运行时按 kind 解析平台默认模型）。原来硬要求 agent.model_id → run_shell 对所有
+            # 平台 agent 永远报「Cannot locate the initiating agent's model」→ MCP 装不了。
+            # 改用 _resolve_agent_model（model_id 缺失时回落平台默认 by kind），与 daemon 一致。
+            try:
+                model = await agent_service._resolve_agent_model(db, agent)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": f"无法解析安全门模型（平台默认模型未配置？）：{exc}"}
             llm = await agent_service._build_llm(db, model, agent)
-            judge = make_shell_judge(llm)
+            # ADR-030 · 门提示词后台可编辑（system_settings key `shell_judge.system_prompt`，
+            # 缺省回落默认）+ 喂入本任务 DB 已核实的用户审批 → 用户已批准的操作(如授权安装 MCP)放行。
+            from app.core import system_settings as _ss
+            gate_prompt = await _ss.get(db, "shell_judge.system_prompt", None)
+            approvals = await _recent_approved_decisions(db, ctx.mission_id)
+            judge = make_shell_judge(
+                llm, system_prompt=gate_prompt or None, approvals=approvals,
+            )
             return await execute_guarded_shell(
                 command, cwd=cwd, reason=reason, judge=judge, db=db, actor=actor,
             )
@@ -1684,6 +1748,22 @@ def mcp_ensure_ready_tool(ctx: BuiltinToolContext) -> StructuredTool:
                     "ok": False,
                     "error_code": "MCPSERVER_NOT_FOUND",
                     "error": f"mcp_server {mcp_server_id} does not exist (first mcp_server_register to register, then ensure_ready)",
+                }
+
+            # 修 mission-7a9afb 假 ready：本地部署的 http MCP 是平台要拉起的进程，无 startup_command
+            # 就无从 launch → generate_manifest 不会产 server_up 要求 → 探针无事可查 → 误判 ready。
+            # 这里**硬失败**，逼 super 走「装好 → 带 startup_command 注册」正流程，而非静默假成功。
+            # （stdio 由 client 用 command 拉起、远端 http 是已跑的服务，均无需 startup_command。）
+            if deployment == "local" and server.server_type == "http" and not server.startup_command:
+                return {
+                    "ok": False,
+                    "error_code": "NO_STARTUP_COMMAND",
+                    "error": (
+                        f"本地 http MCP「{server.name}」没有 startup_command，平台无法拉起 → 不可能 ready。"
+                        "请先 ① request_approval 征得安装同意 → ② run_shell 按 SETUP 装好并确认可启动 → "
+                        "③ 用 mcp_server_register(url=..., startup_command=[...], startup_cwd=...) 重新注册（或更新）→ "
+                        "④ 再调 mcp_ensure_ready。不要在未真正安装启动前就当作 ready。"
+                    ),
                 }
 
             # 1. 初始 manifest（server_up 不需内省，从 startup_command 即可）
@@ -1755,6 +1835,38 @@ def activate_super_first_run_tool(ctx: BuiltinToolContext) -> StructuredTool:
             return {"ok": False, "error": f"mission_id is invalid: {exc}"}
 
         async with ctx.db_factory() as db:
+            # 2026-07-03 完整性 gate（与 build_finalizer 共用）：LLM 曾直接调本技能
+            # 自我认证激活残废 super（roster 空 + 8 孤儿 worker），写下 super_activated
+            # 后 finalize 永远 already_finalized 短路 → gate 形同虚设。技能路径必须过
+            # 同一 gate；不完整 → 拒绝 + 缺口回流（错误驱动自愈）。
+            _proj0 = await db.get(Mission, pid)
+            if _proj0 is not None and _proj0.supervisor_agent_id is not None:
+                from app.models.agent import Agent as _Agent
+                from app.services.build_finalizer import (
+                    auto_adopt_orphan_workers,
+                    check_build_completeness,
+                )
+                _sup0 = await db.get(_Agent, _proj0.supervisor_agent_id)
+                if _sup0 is not None:
+                    # 确定性自修复：本 builder 会话建的孤儿 worker 先收编进花名册
+                    try:
+                        await auto_adopt_orphan_workers(db, _sup0, ctx.mission_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    comp = await check_build_completeness(db, _sup0)
+                    if not comp["complete"]:
+                        return {
+                            "ok": False,
+                            "error": "BUILD_INCOMPLETE",
+                            "missing_workers": comp["missing_workers"],
+                            "orphan_workers": comp["orphan_workers"],
+                            "instruction": (
+                                "构建不完整，拒绝激活。请补齐后重试：为 missing_workers 里的每个能力 "
+                                "agent_create worker；把 orphan_workers 里的能力用 agent_update("
+                                "agent_id=<super>, extra_config={'required_capabilities': [<全部能力>]}) "
+                                "声明进 super 花名册。"
+                            ),
+                        }
             # kickoff 首跑（super soul §0 会提案-确认问定位）。ADR-018：daemon 直接跑 (mission, 'main')
             await mission_daemon.start(db, pid, kickoff=True)
             proj = await db.get(Mission, pid)

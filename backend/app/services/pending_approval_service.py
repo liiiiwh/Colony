@@ -104,13 +104,16 @@ async def _pause_for_pending(db: AsyncSession, mission_id: uuid.UUID) -> None:
         logger.exception("[pending_approval] 落卡暂停 mission 失败（不阻塞）mission=%s", mission_id)
         return
 
-    # ADR-028 D4 · H1 · 人工门落卡 → 硬停当前 tick（cooperative cancel；E2 在每个 tool 结果后检查）。
-    # 否则 super 会「再蹦几个」工具才停。cancel_current_tick 自身幂等（无 running tick → no-op）。
+    # ADR-028 D4 · H1 · 人工门落卡 → **只发协作取消信号**（E2 在每个 tool 结果后检查）。
+    # ⚠️ 不能 cancel_current_tick：本函数在 tick 的 LangGraph tool 子 task 里执行，
+    # `task is current_task()` 自检失效 → 硬 cancel 路径 = tool 等 tick、tick 等 tool 的
+    # 死锁，超时强 cancel 再撞千层 gather 链 RecursionError → tick 僵尸永久持锁
+    # （2026-07-03 mission-cc129f 审批后挂死事故）。
     try:
         from app.services import super_inbox
-        await super_inbox.cancel_current_tick(mission_id)
+        super_inbox.signal_cancel(mission_id)
     except Exception:  # noqa: BLE001
-        logger.exception("[pending_approval] H1 cancel_current_tick 失败（不阻塞）mission=%s", mission_id)
+        logger.exception("[pending_approval] H1 signal_cancel 失败（不阻塞）mission=%s", mission_id)
 
 
 async def _resume_after_clarification(db: AsyncSession, mission_id: uuid.UUID) -> None:
@@ -155,13 +158,14 @@ async def create_pending(
 
     ADR-025 D3 · 落卡即把 mission 暂停到 paused_clarification（有卡⟺暂停不变式）。
     request_id 可由调用方（如 request_approval skill）传入复用业务 ID；不传则自生。"""
-    # ADR-024 #2 · 同 (mission, thread) 已有未决审批 → 复用不新建（审批阻塞串行；
-    # LLM 每次措辞不同不能按 title 去重）。杜绝「没审批又跑一次冒等价新卡」。
+    # ADR-024 #2 + 单卡不变量（2026-07-03）· mission 内已有任何未决审批 → 复用不新建。
+    # **不看 thread_key**：super 提案卡（thread='main'）与 readiness QR 卡（thread=None）曾
+    # 因 thread_key 不一致绕过去重 → 双卡并存 → chat-as-comment 误杀。收窄到 mission 级：
+    # 每 mission 至多一张 pending 卡，杜绝连续多卡。
     existing = (await db.execute(
         select(PendingApproval)
         .where(
             PendingApproval.mission_id == mission_id,
-            PendingApproval.thread_key == thread_key,
             PendingApproval.status == "pending",
         )
         .order_by(PendingApproval.created_at.asc())
@@ -288,6 +292,41 @@ async def _dispatch_to_wechat(db: AsyncSession, row: PendingApproval) -> None:
         )
 
 
+async def _readiness_reason_for(db: AsyncSession, mission_id: uuid.UUID) -> str | None:
+    """mission 若因 readiness 人工门暂停，返回其 paused_reason，否则 None。"""
+    from app.models.mission import Mission
+
+    proj = await db.get(Mission, mission_id)
+    if proj is None or proj.lifecycle_status != "paused_waiting_capability":
+        return None
+    reason = proj.paused_reason or ""
+    return reason if reason.startswith("readiness:") else None
+
+
+async def _rerun_readiness_if_applicable(
+    db: AsyncSession, mission_id: uuid.UUID, reason: str
+) -> None:
+    """readiness 卡（QR/密钥/条款）决策后重跑 ensure_ready 复验。
+
+    reason 形如 'readiness:<server>:<req> …'。重跑 ensure_ready_for_server：登录已完成 →
+    无 pending，mission 由复验自然继续；未完成 → 重新拉一张新 QR 卡（QR 会过期，每次复验拉
+    新的即可，无需单独刷新端点）。死按钮由此闭环。
+    """
+    from app.models.skill import MCPServer
+    from sqlalchemy import select as _sel
+
+    server_name = reason.split(":", 2)[1] if reason.count(":") >= 2 else None
+    if not server_name:
+        return
+    server = (await db.execute(
+        _sel(MCPServer).where(MCPServer.name == server_name)
+    )).scalar_one_or_none()
+    if server is None:
+        return
+    from app.services import readiness as rd
+    await rd.ensure_ready_for_server(db, server.id, mission_id=mission_id)
+
+
 async def decide(
     db: AsyncSession,
     *,
@@ -312,9 +351,20 @@ async def decide(
     await db.commit()
     await db.refresh(row)
 
+    # 在 resume 翻态之前先抓 readiness 上下文（_resume_after_clarification 会把 mission 转 running）。
+    _readiness_reason = await _readiness_reason_for(db, row.mission_id)
+
     # ADR-025 D3 · 答卡即恢复：至多一张卡，故无需查其它 pending。触发 tick 前先 resolve→running，
     # 否则唤醒的 tick 会被 paused 守卫挡掉。
     await _resume_after_clarification(db, row.mission_id)
+
+    # QR/密钥等 readiness 卡的「我已完成/刷新」→ 重跑 ensure_ready 复验（复验恢复钩子）：
+    # 登录成功则不再 pending、mission 复位继续；否则重新拉一张新 QR。死按钮由此闭环。
+    if _readiness_reason:
+        try:
+            await _rerun_readiness_if_applicable(db, row.mission_id, _readiness_reason)
+        except Exception:  # noqa: BLE001
+            logger.exception("[pending_approval] readiness 复验失败（不阻塞）req=%s", request_id)
 
     # ADR-018 mission-only · 审批结果作为 [approval_response] 写入 (mission_id, thread_key)，
     # 并 enqueue 进 super_inbox + 触发 idle-tick（daemon super 下一 tick pick up）。
@@ -370,11 +420,17 @@ async def _write_response_message(
     db: AsyncSession, row: PendingApproval, option: str, decided_by: str
 ) -> None:
     """把 [approval_response] 消息落到 (mission_id=mission_id, thread_key)（ADR-018 mission-only）。"""
+    # 回执必须自包含被确认的方案正文——原卡片可能已滑出 LLM 上下文（隔了很久 / 被压缩），
+    # 只给标题会让确认后的 tick 靠标题脑补方案（真出过：幻觉出方案里不存在的 worker）。
+    body = (row.message or "").strip()
+    if len(body) > 4000:
+        body = body[:4000] + "\n…（正文过长已截断）"
     payload_text = "\n".join(
         [
             f"[approval_response request_id={row.request_id}]",
             f"审批标题：{row.title}",
-            f"审批说明：（同 pending 内容）",
+            "审批说明（用户确认的就是下面这份内容，执行时以此为准）：",
+            body or "（无正文）",
             f"用户选择：{option}",
             f"决策人：{decided_by}",
         ]

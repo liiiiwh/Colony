@@ -1,6 +1,6 @@
 'use client';
 
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import { renderToStaticMarkup } from 'react-dom/server';
 import remarkGfm from 'remark-gfm';
 import rehypeSanitize from 'rehype-sanitize';
@@ -22,9 +22,22 @@ const SANITIZE_SCHEMA = {
   },
 };
 
+// react-markdown 的 defaultUrlTransform 在 rehype-sanitize **之前**跑，会把非 http(s)
+// 协议掐成空串——上面 SANITIZE_SCHEMA 给 img src 放行的 data:（ADR-012 R4，QR base64）
+// 因此从未生效（2026-07-03 QR 卡白图实证）。这里放行 data:image/*，其余仍走默认转换；
+// data:image 在 <img src> 不执行脚本，且 sanitize 仍限定只有 img.src 收 data: 协议。
+function urlTransform(url: string): string {
+  if (url.startsWith('data:image/')) return url;
+  return defaultUrlTransform(url);
+}
+
 export function renderMarkdownToHtml(content: string): string {
   return renderToStaticMarkup(
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeSanitize, SANITIZE_SCHEMA]]}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[[rehypeSanitize, SANITIZE_SCHEMA]]}
+      urlTransform={urlTransform}
+    >
       {content || '(无内容)'}
     </ReactMarkdown>,
   );
@@ -57,7 +70,11 @@ export function MarkdownViewer({
         className,
       )}
     >
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeSanitize, SANITIZE_SCHEMA]]}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeSanitize, SANITIZE_SCHEMA]]}
+        urlTransform={urlTransform}
+      >
         {content || '(无内容)'}
       </ReactMarkdown>
     </div>

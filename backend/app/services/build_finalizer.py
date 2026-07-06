@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,138 @@ async def _bound_or_managed_mcp_ids(db: AsyncSession, mission_id) -> list:
     return list(managed)
 
 
+async def check_build_completeness(db: AsyncSession, super_agent) -> dict:
+    """校验 super 的构建完整性：roster ⟺ worker 双向一致（2026-07-03 install-first gate）。
+
+    可靠的结构不变量（不依赖 LLM 自觉）：
+    - missing_workers：super.required_capabilities 里声明了、但平台没有对应 enabled worker 的 cap。
+    - orphan_workers：建了非系统 worker、但**没有任何 super** 的 required_capabilities 声明它 →
+      super 不会 invoke_worker 它 → 残废（真出的 bug：6 个 worker 全孤儿、roster 空）。
+    complete = 两者皆空。
+    """
+    from app.models.agent import Agent
+
+    roster = list(((super_agent.extra_config or {}).get("required_capabilities") or []))
+    workers = (await db.execute(
+        select(Agent).where(
+            Agent.kind == "worker", Agent.is_system.is_(False), Agent.capability.is_not(None)
+        )
+    )).scalars().all()
+    worker_caps = {w.capability for w in workers}
+
+    # 所有 super 声明的 capability 全集（判孤儿：worker 没被任何 super 声明）
+    supers = (await db.execute(select(Agent).where(Agent.kind == "super"))).scalars().all()
+    all_declared: set = set()
+    for s in supers:
+        all_declared.update((s.extra_config or {}).get("required_capabilities") or [])
+
+    missing_workers = sorted(c for c in roster if c and c not in worker_caps)
+    orphan_workers = sorted(c for c in worker_caps if c not in all_declared)
+    # 空构建洞（2026-07-06 e2e 实证）：业务 super 花名册为空 → 什么都 invoke_worker 不了 →
+    # 残废。missing/orphan 都空时旧逻辑"真空完整"会放行（installer 超时→Builder 回退→建了
+    # super 装了 MCP 但 0 worker、roster 空的真实形态）。系统 super（Builder/Worker-Opt）本就
+    # 无 roster，不受此规则约束。
+    empty_roster = (not roster) and (not bool(getattr(super_agent, "is_system", False)))
+
+    # 未绑 MCP 洞（2026-07-06 e2e 实证残留）：installer 装好+注册了受管本地 MCP，但 Builder
+    # 建完 worker 忘了 agent_mcp_bind（LLM 超时/漏步）→ worker 用不上 MCP 方法（用户原始投诉）。
+    # 结构化强制"必绑"：受管本地 MCP（有 startup_command、启用）却没绑给**任何业务 worker**
+    # → 基础设施白装、super 残废 → 不完整，退回 Builder 绑。不 auto-bind，只把"必绑"变 gate 兜底。
+    unbound_mcp = await _unbound_managed_mcps(db)
+
+    complete = (
+        not missing_workers and not orphan_workers
+        and not empty_roster and not unbound_mcp
+    )
+    return {
+        "complete": complete,
+        "missing_workers": missing_workers,
+        "orphan_workers": orphan_workers,
+        "empty_roster": empty_roster,
+        "unbound_mcp": unbound_mcp,
+    }
+
+
+async def _unbound_managed_mcps(db: AsyncSession) -> list[str]:
+    """受管本地 MCP（server_type='http'、启用、有 startup_command）但没绑给任何**非系统**
+    worker 的名字列表。用于 gate 强制 install-first 后的"必绑"（2026-07-06）。"""
+    rows = await db.execute(text(
+        "SELECT m.name FROM mcp_servers m "
+        "WHERE m.server_type='http' AND m.is_enabled IS TRUE AND m.startup_command IS NOT NULL "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM agent_mcp_servers ams JOIN agents a ON a.id = ams.agent_id "
+        "  WHERE ams.mcp_server_id = m.id AND a.is_system IS NOT TRUE AND a.kind='worker'"
+        ")"
+    ))
+    return sorted(r[0] for r in rows.all())
+
+
+async def auto_adopt_orphan_workers(
+    db: AsyncSession, super_agent, builder_mission_id
+) -> list[str]:
+    """确定性自修复（2026-07-05）：把「本 builder mission 建的孤儿 worker」自动并入
+    super.required_capabilities，返回收编的 capability 列表。
+
+    背景：花名册声明曾靠 Builder LLM 自觉调 agent_update——e2e 实证它三连无视精确
+    指令（gate 拦了 3 次都回「无需动作」）。孤儿收编是纯确定性问题：worker 存在、
+    有 capability、provenance（built_by_mission_id）指向本次构建、没被任何 super
+    声明 → 它就该进本 super 的花名册。missing_workers（声明了没建）仍是硬缺口，
+    只能真建，不在本函数职责内。"""
+    from app.models.agent import Agent
+
+    if builder_mission_id is None:
+        return []
+    workers = (await db.execute(
+        select(Agent).where(
+            Agent.kind == "worker", Agent.is_system.is_(False),
+            Agent.capability.is_not(None),
+            Agent.built_by_mission_id == builder_mission_id,
+        )
+    )).scalars().all()
+    if not workers:
+        return []
+    supers = (await db.execute(select(Agent).where(Agent.kind == "super"))).scalars().all()
+    declared: set = set()
+    for s in supers:
+        declared.update((s.extra_config or {}).get("required_capabilities") or [])
+    adopted = sorted({w.capability for w in workers} - declared)
+    if not adopted:
+        return []
+    cfg = dict(super_agent.extra_config or {})
+    roster = list(cfg.get("required_capabilities") or [])
+    cfg["required_capabilities"] = roster + [c for c in adopted if c not in roster]
+    super_agent.extra_config = cfg
+    await db.commit()
+    logger.info(
+        "[finalize] 自修复：收编本次构建的孤儿 worker 进花名册 super=%s adopted=%s",
+        super_agent.slug or super_agent.name, adopted,
+    )
+    return adopted
+
+
+async def _count_unconsumed_incomplete(db: AsyncSession, mission_id) -> int:
+    """builder pending 队列里未消费的 build_incomplete 条数（gate 入队去重用）。"""
+    row = await db.execute(text(
+        "SELECT COUNT(*) FROM super_pending_messages "
+        "WHERE super_mission_id = :p AND status = 'pending' "
+        "AND meta::text LIKE '%build_incomplete%'"
+    ), {"p": str(mission_id)})
+    return int(row.scalar() or 0)
+
+
+# gate 入队上限：enqueue→drain→tick→gate 再评的链条，若 LLM 永远修不好会无限烧 token。
+_INCOMPLETE_ENQUEUE_CAP = 3
+
+
+async def _count_incomplete_reports(db: AsyncSession, project_slug: str) -> int:
+    """该 project 历史上已报过几次 build_incomplete（messages 表，跨 tick 累计）。"""
+    row = await db.execute(text(
+        "SELECT COUNT(*) FROM messages WHERE meta->>'type'='build_incomplete' "
+        "AND meta->>'project_slug'=:s"
+    ), {"s": project_slug})
+    return int(row.scalar() or 0)
+
+
 async def finalize_super_build(
     db: AsyncSession, mission_id, notify_mission_id, notify_thread_key
 ) -> dict:
@@ -105,6 +237,79 @@ async def finalize_super_build(
     if already:
         return {"skipped": "already_finalized", "project_slug": proj.slug,
                 "actions": actions}
+
+    # 0.5 完整性 gate（2026-07-03 install-first）：roster ⟺ worker 不一致 → 不激活残废 super，
+    # 回 builder 会话报缺口，等 Builder 下一轮补齐。把"齐不齐"从 LLM 自觉变 FSM 兜底。
+    from app.models.agent import Agent as _Agent
+    _sup = await db.get(_Agent, proj.supervisor_agent_id)
+    if _sup is not None:
+        # 0.4 确定性自修复：先把本 builder mission 建的孤儿 worker 收编进花名册
+        # （LLM 屡次无视声明指令，孤儿收编是纯确定性问题，代劳）。
+        try:
+            await auto_adopt_orphan_workers(db, _sup, notify_mission_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("[finalize] 孤儿 worker 自修复失败（不阻塞，走 gate 报缺口）")
+        comp = await check_build_completeness(db, _sup)
+        if not comp["complete"]:
+            gaps = []
+            if comp.get("empty_roster"):
+                gaps.append(
+                    "super 花名册（required_capabilities）为空且没有任何业务 worker——"
+                    "还没真正开始建 worker。请按方案为每个能力 agent_create(kind='worker') "
+                    "建 worker（依赖的 MCP/skill 先装好绑好），再 agent_update 声明完整花名册。"
+                )
+            if comp["missing_workers"]:
+                gaps.append(f"声明了但没建 worker 的能力：{', '.join(comp['missing_workers'])}")
+            if comp["orphan_workers"]:
+                gaps.append(
+                    f"建了 worker 但未纳入 super 花名册（required_capabilities）："
+                    f"{', '.join(comp['orphan_workers'])}"
+                )
+            if comp.get("unbound_mcp"):
+                gaps.append(
+                    f"已安装注册的 MCP 还没绑给任何 worker（worker 会用不上它的方法）："
+                    f"{', '.join(comp['unbound_mcp'])}——请对依赖它的 worker 调 "
+                    f"agent_mcp_bind(agent_id=<worker>, mcp_server_id=<该 MCP 的 id>)。"
+                )
+            msg = (
+                f"⚠️ 「{proj.name or proj.slug}」构建未完成，暂不激活。缺口：\n- "
+                + "\n- ".join(gaps)
+                + "\n请补齐：为每个能力建 worker + 用 agent_update("
+                "extra_config={'required_capabilities':[...]}) 声明完整花名册（含依赖的 MCP/skill 装好绑好），再收尾。"
+            )
+            if notify_mission_id:
+                try:
+                    await messaging_service.append_message(
+                        db, notify_mission_id, notify_thread_key or "main", role="agent_log",
+                        content=msg,
+                        meta={"type": "build_incomplete", "project_slug": proj.slug,
+                              "missing_workers": comp["missing_workers"],
+                              "orphan_workers": comp["orphan_workers"]},
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("[finalize] 写 build_incomplete 消息失败")
+                # 2026-07-03 e2e 实证停摆点：只写 agent_log 的话，builder tick 结束转
+                # paused_idle 后**没有任何触发器**让它补 roster → 永远停摆。把缺口报告
+                # enqueue 进 builder pending 队列：tick 边界 auto-drain（paused_idle 可
+                # 消费）/ 重启 reconcile 都会据此接力开 tick。防失控：已有未消费的
+                # build_incomplete pending 时不重复入队（每轮 tick 末 gate 都会重评）。
+                try:
+                    if (
+                        await _count_unconsumed_incomplete(db, notify_mission_id) == 0
+                        and await _count_incomplete_reports(db, proj.slug) < _INCOMPLETE_ENQUEUE_CAP
+                    ):
+                        from app.models.mission import Mission as _Mission
+                        from app.services import pending_queue as _pq
+                        nproj = await db.get(_Mission, notify_mission_id)
+                        if nproj is not None and nproj.supervisor_agent_id is not None:
+                            await _pq.enqueue_user_message(
+                                db, notify_mission_id, nproj.supervisor_agent_id, msg,
+                                meta={"type": "build_incomplete", "project_slug": proj.slug},
+                            )
+                except Exception:  # noqa: BLE001
+                    logger.exception("[finalize] enqueue build_incomplete 失败（不阻塞）")
+            logger.warning("[finalize] 构建不完整，不激活 project=%s 缺口=%s", proj.slug, comp)
+            return {"skipped": "incomplete", "project_slug": proj.slug, **comp}
 
     # 1. ensure_ready 相关本地 MCP（QR/密钥卡落到本 super 项目会话）
     try:

@@ -50,6 +50,7 @@ import type { MissionLifecycleAction } from '@/types/mission';
 import { errMessage } from '@/lib/errors';
 
 type RightTab = 'activity' | 'schedule' | 'memory' | 'threads';
+import { refreshAuthToken } from '@/lib/api';
 import {
   superConversationApi,
   type ChatAttachment,
@@ -151,6 +152,21 @@ export default function SuperWorkstation() {
   const [rightTab, setRightTab] = useState<RightTab>('activity');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const esRef = useRef<EventSource | null>(null);
+  // ADR-030 · 用户刚操作(发消息/点审批)后到 AI 首个输出前的乐观「等待回复」态：
+  // 立即在 AI 回复位置显示 loading 气泡，避免用户误以为程序卡死。SSE 的 is_running 投递偶有
+  // 延迟，故不单靠它——本地 flag 一操作即亮，首个新 AI 输出到达/token 直播/超时即灭。
+  const [awaitingReply, setAwaitingReply] = useState(false);
+  const awaitingBaselineRef = useRef(0);
+  const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const beginAwaitingReply = () => {
+    awaitingBaselineRef.current = messages.filter(
+      (m) => m.role !== 'user' && m.id !== 'stream-live',
+    ).length;
+    setAwaitingReply(true);
+    if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+    // 安全兜底：120s 无输出自动灭，避免永久转圈
+    awaitingTimerRef.current = setTimeout(() => setAwaitingReply(false), 120_000);
+  };
 
   // ADR-018 mission-only · 切换查看哪个 thread 的消息流（thread_key 标识）
   const switchToThread = async (threadKey: string) => {
@@ -238,6 +254,17 @@ export default function SuperWorkstation() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slug]);
 
+  // ADR-030 · 首个新 AI 输出（agent_log/assistant/tick 或 token 直播）到达即熄灭「等待回复」气泡。
+  useEffect(() => {
+    if (!awaitingReply) return;
+    const hasLiveToken = messages.some((m) => m.id === 'stream-live');
+    const nonUser = messages.filter((m) => m.role !== 'user' && m.id !== 'stream-live').length;
+    if (hasLiveToken || nonUser > awaitingBaselineRef.current) {
+      setAwaitingReply(false);
+      if (awaitingTimerRef.current) clearTimeout(awaitingTimerRef.current);
+    }
+  }, [messages, awaitingReply]);
+
   // Spawn a new mission (instance) of this super, then switch to it.
   async function spawnMission() {
     if (!project?.supervisor_agent_id || !newMissionName.trim() || spawning) return;
@@ -286,8 +313,17 @@ export default function SuperWorkstation() {
         /* ignore */
       }
     };
+    let refreshedOnce = false;
     es.onerror = () => {
-      // EventSource auto-reconnect；不打扰用户
+      // EventSource 把 token 烧进 URL，过期后原生重连仍带旧 token → 永久 401（会话卡片
+      // 不再实时刷新、审批状态僵死）。主动刷新一次 token：store 更新 → 本 effect 依赖 token
+      // 变化 → 重建 EventSource 带新 token。刷新失败（refresh token 也过期）时 axios 层会
+      // 清 auth 跳登录，这里不重复处理。guard 防紧循环刷新。
+      if (refreshedOnce) return;
+      refreshedOnce = true;
+      refreshAuthToken().catch(() => {
+        /* refresh 失败：axios 拦截器负责 clearAuth；此处静默 */
+      });
     };
     return () => {
       es.close();
@@ -389,6 +425,7 @@ export default function SuperWorkstation() {
         };
         // dedup：SSE 可能在 await chat() 返回前已把同 id 的真实消息推进来 → 不要再叠一条
         setMessages((prev) => (prev.some((x) => x.id === tmp.id) ? prev : [...prev, tmp]));
+        beginAwaitingReply();  // ADR-030 · 发消息后立即在 AI 回复位置显示 loading 气泡
         // 反馈：组合 auto_started / triggered / warning 给用户清晰信息
         const parts: string[] = [];
         if (res.auto_started) parts.push(`🟢 ${t('workbench.superAutoStarted')}`);
@@ -521,7 +558,11 @@ export default function SuperWorkstation() {
           <span className="text-xs text-muted-foreground truncate max-w-[200px]">/ {project.name}</span>
         )}
         {lifecycleBadge}
-        {streamState.is_running && (
+        {streamState.is_running
+          && (streamState.pending_count ?? 0) === 0
+          && !['paused_clarification', 'paused_waiting_capability', 'paused_idle', 'stopped'].includes(
+            streamState.lifecycle_status || project?.lifecycle_status || '',
+          ) && (
           <span className="text-xs text-primary flex items-center gap-1">
             <Loader2 className="w-3 h-3 animate-spin" /> {t('workbench.ticking')}
           </span>
@@ -697,6 +738,7 @@ export default function SuperWorkstation() {
                               : x,
                           ),
                         );
+                        beginAwaitingReply();  // ADR-030 · 点审批后立即显示 loading 气泡（决卡→续跑 tick 有空窗）
                       }}
                     />
                   );
@@ -844,6 +886,21 @@ export default function SuperWorkstation() {
             {messages.length === 0 && approvals.length === 0 && (
               <div className="text-center text-muted-foreground text-sm p-8">
                 {t('workbench.noConversationYet')}
+              </div>
+            )}
+            {/* ADR-030 · 用户刚操作(发消息/点审批)后或 tick 运行中，且尚无 token 直播（如 LLM 思考期）→
+                在 AI 回复位置显示动态 loading 气泡，避免用户误以为程序卡死；首个新 AI 输出/token 直播/
+                超时即自动消失。awaitingReply 补足 SSE is_running 投递延迟的空窗。
+                ⚠️ 但**暂停等人**时（有未决审批卡 / paused_for_human）绝不显示——此刻 AI 在等你，不是在跑。 */}
+            {(awaitingReply || streamState.is_running)
+              && !approvals.some((a) => !a.resolution)
+              && !['paused_clarification', 'paused_waiting_capability'].includes(
+                streamState.lifecycle_status || project?.lifecycle_status || '',
+              )
+              && !messages.some((m) => m.id === 'stream-live') && (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground px-3 py-2 rounded-[14px] bg-muted/40 w-fit my-1">
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                <span>{t('workbench.assistantThinking')}</span>
               </div>
             )}
             <div ref={messagesEndRef} />

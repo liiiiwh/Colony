@@ -31,6 +31,9 @@ from app.services import super_inbox
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["super-conversation"])
 
+# run_once no-op（已有 tick 在跑）时，退避多久再轮询 respawn 续跑。防零延迟 busy-loop。
+_SKIP_RESPAWN_BACKOFF_SEC = 1.0
+
 
 class ChatAttachment(BaseModel):
     kind: str  # 'image' | 'file'
@@ -204,7 +207,8 @@ async def _autostart_and_trigger(
     triggered = False
     if auto_trigger and should_trigger_now(is_running=_is_running, runtime_status=current_runtime):
         try:
-            asyncio.create_task(_trigger_tick_async(mission_id, user_id))
+            from app.services.mission_daemon import _spawn_bg
+            _spawn_bg(_trigger_tick_async(mission_id, user_id), name=f"tick-{mission_id}")
             triggered = True
         except Exception:
             logger.exception("[autostart] trigger tick failed (不阻塞)")
@@ -268,10 +272,13 @@ async def super_chat(slug: str, body: ChatBody, db: DBSession, user: CurrentUser
     try:
         from app.models.approvals import PendingApproval as _PA
         from sqlalchemy import select as _sel
+        # 绑**最新**那张 pending 卡：用户的自由文本回应的是刚弹出来的卡（如 QR），
+        # 不是很久前遗留的卡（旧代码取 asc 最旧 → 误杀遗留的运营计划卡，v4 真出过）。
+        # 单卡不变量下 mission 至多一张，desc 只是稳妥兜底。
         oldest_pa = (await db.execute(
             _sel(_PA)
             .where(_PA.mission_id == proj.id, _PA.status == "pending")
-            .order_by(_PA.created_at.asc())
+            .order_by(_PA.created_at.desc())
             .limit(1)
         )).scalar_one_or_none()
         if oldest_pa is not None:
@@ -375,19 +382,27 @@ async def _trigger_tick_async(mission_id: uuid.UUID, actor_user_id: uuid.UUID | 
     from app.services import mission_daemon
 
     async def _run() -> None:
+        _skipped = False
         try:
             async with AsyncSessionLocal() as db:
-                await mission_daemon.run_once(
+                _res = await mission_daemon.run_once(
                     db, mission_id,
                     payload={"trigger": "user_chat", "user_message": ""},  # message 走 pending 队列读
                 )
+                _skipped = bool(isinstance(_res, dict) and _res.get("skipped"))
         except asyncio.CancelledError:
             logger.info("[trigger_tick] project=%s cancelled (cooperative)", mission_id)
         except Exception:
             logger.exception("[trigger_tick] failed project=%s", mission_id)
         finally:
-            super_inbox.unregister_task(mission_id)
-            # V7.2 · tick 边界 auto-drain：本 tick 跑完后若还有 pending，立即开下一 tick
+            # V7.2 · tick 边界 auto-drain：本 tick 跑完后若还有 pending，立即开下一 tick。
+            # ⚠️ run_once no-op（已有 tick 在跑 → skipped）时**退避**再 respawn，而不是零延迟自触发：
+            # daemon 循环跑的 kickoff/scheduled tick 结束时不走本 auto-drain，故必须由本路径轮询
+            # 到锁释放才能接力续跑（不能直接 return，否则审批后续跑丢失）。但零延迟 respawn 会
+            # busy-loop（真出过 83s 空转 10 万次 + 每轮开 2 个 DB session 耗尽连接池，用户审批后
+            # 干等一分多钟）。退避到 ~1/s：既保证续跑不丢，又不烧 CPU / 不撑爆池。
+            if _skipped:
+                await asyncio.sleep(_SKIP_RESPAWN_BACKOFF_SEC)
             try:
                 from app.domain.tick_policy import should_drain_after_tick
                 async with AsyncSessionLocal() as _db:
@@ -396,13 +411,22 @@ async def _trigger_tick_async(mission_id: uuid.UUID, actor_user_id: uuid.UUID | 
                     _fresh = await _db.get(Mission, mission_id)
                     _ls = (_fresh.lifecycle_status if _fresh else "") or ""
                 if should_drain_after_tick(pending_count=_pending, lifecycle_status=_ls):
-                    logger.info("[trigger_tick] auto-drain: %d pending → 立即开下一 tick", _pending)
-                    asyncio.create_task(_trigger_tick_async(mission_id, actor_user_id))
+                    if not _skipped:
+                        logger.info("[trigger_tick] auto-drain: %d pending → 立即开下一 tick", _pending)
+                    from app.services.mission_daemon import _spawn_bg
+                    _spawn_bg(
+                        _trigger_tick_async(mission_id, actor_user_id),
+                        name=f"drain-tick-{mission_id}",
+                    )
             except Exception:
                 logger.exception("[trigger_tick] auto-drain check failed (不阻塞)")
 
-    task = asyncio.create_task(_run())
-    super_inbox.register_task(mission_id, task)
+    # ⚠️ 这里**不注册** task：注册归 run_once 里抢到并发锁的真 tick（_run_once_body 自注册）。
+    # 老代码在此 register_task → 1s 退避轮询的每个 skip task 都覆盖注册表、并清掉
+    # cancel_event（人工门协作取消信号每秒被抹一次）；其 finally 的无条件 unregister 又会
+    # 弹掉真 tick 的注册 → 外部 cancel 找错对象（2026-07-03 事故帮凶）。
+    from app.services.mission_daemon import _spawn_bg
+    _spawn_bg(_run(), name=f"tick-run-{mission_id}")
 
 
 class InterruptResp(BaseModel):

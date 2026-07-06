@@ -117,6 +117,30 @@ async def ensure_worker_optimization_super(
         agent.is_system = True
         agent.kind = "super"
 
+    # super 工具集幂等补齐：is_system agent 豁免 reconcile 回填（2026-07 决议），
+    # 它的技能集由这里 seed 专管——存量 agent 缺绑（如脏绑定清理误清）也能自愈。
+    from app.models.agent import AgentSkill
+    from app.models.skill import Skill
+
+    scope_skills = (await db.execute(
+        select(Skill).where(
+            Skill.is_builtin.is_(True),
+            Skill.is_enabled.is_(True),
+            Skill.scope.in_(("super", "all")),
+        )
+    )).scalars().all()
+    bound_ids = set((await db.execute(
+        select(AgentSkill.skill_id).where(AgentSkill.agent_id == agent.id)
+    )).scalars().all())
+    added = 0
+    for sk in scope_skills:
+        if sk.id not in bound_ids:
+            db.add(AgentSkill(agent_id=agent.id, skill_id=sk.id, config={}))
+            added += 1
+    if added:
+        await db.flush()
+        logger.info("[worker_opt] 补齐 super 工具集 %d 个 skill", added)
+
     admin = await _platform_admin(db)
     if admin is None:
         logger.warning("[worker_opt] admin user 未就绪，跳过 mission seed")

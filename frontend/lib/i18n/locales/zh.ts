@@ -459,6 +459,7 @@ export const zh: Messages = {
     systemMsg: '系统',
     sysMsgKind: { dispatch: '派单', health: '健康自检', issue: '降级信号', escalation: '升级请求', approval: '审批回复', system: '自动' },
     ticking: '正在 tick',
+    assistantThinking: 'AI 正在处理…',
     pendingMessages: '{{count}} 待处理消息',
     runOnce: '运行一次',
     start: '启动',

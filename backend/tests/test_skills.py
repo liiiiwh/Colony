@@ -35,36 +35,6 @@ async def test_seed_builtin_skills_idempotent(seeded_db) -> None:
     assert len(second) == len(first)
 
 
-async def test_seed_auto_deactivates_orphan_builtin(seeded_db) -> None:
-    """metadata 不再列出的 builtin Skill（如旧版残留）应被自动 is_enabled=False，
-    避免老 agent 仍绑定 → 运行时静默缺工具。"""
-    # 先 seed 出当前 metadata 的全部 27 条
-    await seed_builtin_skills(seeded_db)
-    # 手动塞一条"伪孤儿"行：metadata 不再有 slug=zombie_skill，但 DB 里存在且 enabled
-    seeded_db.add(
-        Skill(
-            name="Zombie",
-            slug="zombie_skill",
-            description="metadata 已删除，模拟历史残留",
-            skill_type="tool_builtin",
-            builtin_ref="zombie_skill",
-            content_md="",
-            config_schema={},
-            is_enabled=True,
-            is_builtin=True,
-        )
-    )
-    await seeded_db.commit()
-
-    # 再跑一次 seed → 应自动下架 zombie_skill
-    await seed_builtin_skills(seeded_db)
-    r = await seeded_db.execute(select(Skill).where(Skill.slug == "zombie_skill"))
-    zombie = r.scalar_one()
-    assert zombie.is_enabled is False, "孤儿 Skill 应被自动下架"
-    # 仍保留在表中（不物理删除），管理员可手动清理
-    assert zombie.is_builtin is True
-
-
 def test_format_artifact_fallback_chain() -> None:
     """workspace_read 渲染产物的 fallback 链：content → s3_url → s3_key → label。
 

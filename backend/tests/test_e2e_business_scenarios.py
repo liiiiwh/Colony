@@ -89,7 +89,8 @@ async def test_scenario_a_builder_creates_compliant_super_and_worker(
     )).scalar_one()
     assert worker.kind == "worker"
     assert worker.capability == "xhs_ops"
-    assert worker.built_by_mission_id is None  # worker 不带 provenance
+    # 2026-07-05：worker 也带 provenance（完整性 gate 确定性收编花名册用）
+    assert worker.built_by_mission_id is not None
     wskills = await _agent_skill_slugs(db, worker.id)
     assert "return_result" in wskills  # 合规：自动绑定 worker 默认 skill
 

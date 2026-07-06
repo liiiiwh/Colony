@@ -26,6 +26,63 @@ logger = logging.getLogger(__name__)
 _DEFAULT_RETRIES = 2
 
 
+def _image_block_to_markdown(block: dict) -> str | None:
+    """图片 content block → `![image](data:...)` markdown；不是图片块返回 None。"""
+    btype = block.get("type")
+    if btype == "image_url":
+        url = ((block.get("image_url") or {}).get("url")
+               if isinstance(block.get("image_url"), dict) else block.get("image_url"))
+        if isinstance(url, str) and url:
+            return f"![image]({url})"
+        return None
+    if btype == "image":
+        # langchain-mcp-adapters create_image_block: {"type":"image","base64"/"url","mime_type"}；
+        # MCP 原生: {"type":"image","data","mimeType"}。两种都吃。
+        data = block.get("base64") or block.get("data")
+        mime = block.get("mime_type") or block.get("mimeType") or "image/png"
+        if isinstance(data, str) and data:
+            return f"![image](data:{mime};base64,{data})"
+        url = block.get("url")
+        if isinstance(url, str) and url:
+            return f"![image]({url})"
+    return None
+
+
+def sanitize_mcp_result(res):
+    """MCP 工具结果的多模态消毒（2026-07-05 get_login_qrcode 实证）。
+
+    图片 content block（image_url / MCP 原生 image）回喂 LLM 会炸非多模态模型
+    （litellm.BadRequestError: unknown variant 'image_url'，DeepSeek 家族）。转成
+    `![image](data:<mime>;base64,...)` markdown 文本：worker LLM 可读可转述，
+    落会话后前端内联渲染（markdown-viewer urlTransform 放行 data:image）。
+    无图片块的结果原样返回，不动结构。"""
+    # adapter 工具 response_format='content_and_artifact' → (content, artifact) 元组：
+    # 消毒 content，artifact 原样（首次实证：只认 list 让 tuple 漏过，错误依旧）。
+    if isinstance(res, tuple) and len(res) == 2:
+        return (sanitize_mcp_result(res[0]), res[1])
+    if not isinstance(res, list):
+        return res
+    has_image = any(
+        isinstance(b, dict) and b.get("type") in ("image", "image_url") for b in res
+    )
+    if not has_image:
+        return res
+    parts: list[str] = []
+    for b in res:
+        if isinstance(b, dict):
+            md = _image_block_to_markdown(b)
+            if md is not None:
+                parts.append(md)
+                continue
+            if b.get("type") == "text":
+                parts.append(str(b.get("text") or ""))
+                continue
+            parts.append(str(b))
+        else:
+            parts.append(str(b))
+    return "\n\n".join(p for p in parts if p)
+
+
 async def _report_to_worker_opt(server_name: str, err: Exception, ctx: Any) -> None:
     """Tier 2 — best-effort lightweight signal to the worker-opt mission. Never raises."""
     try:
@@ -60,7 +117,7 @@ def wrap_tool_coroutine(
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                return await orig_coro(*args, **kwargs)
+                return sanitize_mcp_result(await orig_coro(*args, **kwargs))
             except Exception as e:  # noqa: BLE001 — any MCP transport/tool error
                 last_exc = e
                 logger.warning(

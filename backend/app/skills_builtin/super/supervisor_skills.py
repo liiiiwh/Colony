@@ -1,11 +1,10 @@
-"""Supervisor 专用工具：审批 / 调度 Worker / 并行派发 / 表单征询 / 知识沉淀 / 语音体验 (mock)。
+"""Supervisor 专用工具：审批 / 调度 Worker / 并行派发 / 表单征询 / 知识沉淀。
 
 （ADR-018 step5/X：set_branch_description / rollback_to_node 已删 —— rewind 自 ADR-006 废弃，
 mission 单一 workspace 无分支可回退/切换。）
 - `request_approval`：向 SSE 推 data-approval-request 事件 + 落库为 agent_log 消息
 - `request_structured_input`：向用户发起结构化表单征询（JSON Schema → 前端渲染）
 - `archive_to_knowledge`：把当前分支的交付物索引到指定知识库
-- `voice_chat_mock`：LLM 产品角色"立即体验"占位技能（未来替换为真语音 ASR/TTS）
 """
 
 from __future__ import annotations
@@ -520,55 +519,5 @@ def archive_to_knowledge_tool(ctx: BuiltinToolContext) -> StructuredTool:
             "把当前 Mission 所有交付物（S3 上的 deliverable artifacts）索引到指定知识库，供未来项目检索参考。\n"
             "参数：kb_id(str，知识库 UUID) / include_metadata(bool，默认 True，预留)。\n"
             "仅处理 markdown/text/json/html 类产物；image 等二进制跳过。"
-        ),
-    )
-
-
-# ============================================================
-# voice_chat_mock：LLM 产品角色"立即体验"占位技能
-# ============================================================
-def voice_chat_mock_tool(ctx: BuiltinToolContext) -> StructuredTool:
-    """语音对话体验占位技能，未来替换为真 ASR/VAD/TTS。
-
-    当前行为：
-    - 接收用户的文本输入 + role_config JSON
-    - 用当前 Agent 主模型生成一段扮演该角色的回复（纯文本）
-    - 返回给调用者，由上层包装为"语音" mock
-
-    将来：
-    - ASR: 语音 → 文本
-    - VAD: 静音检测
-    - TTS: 文本 → 语音流
-    - 以 skill 形式直接接入
-    """
-
-    async def _chat(role_config_json: str, user_text: str) -> str:
-        if not user_text.strip():
-            return "❌ user_text 不能为空"
-        # 占位：返回一条固定结构的回复，真实路径未来接语音服务
-        import json as _json
-
-        try:
-            cfg = _json.loads(role_config_json) if role_config_json else {}
-        except Exception:
-            cfg = {}
-        persona = cfg.get("persona") or cfg.get("name") or "虚拟产品角色"
-        tone = cfg.get("tone") or cfg.get("style") or "友好、简短"
-        logger.info("🎙️ voice_chat_mock: persona=%s user_text_len=%d", persona, len(user_text))
-        reply = (
-            f"[Mock 语音回复 — 以 {persona} 身份，语气：{tone}]\n"
-            f"你好呀！你刚才说「{user_text[:60]}」对吧？"
-            f"我作为 {persona}，会这样回答你～（真实语音 ASR/TTS 待接入后自动替换本 mock）"
-        )
-        return reply
-
-    return StructuredTool.from_function(
-        coroutine=_chat,
-        name="voice_chat_mock",
-        description=(
-            "【Mock】LLM 产品角色'立即体验'语音对话占位工具。\n"
-            "参数：role_config_json(str，上游 role_configurator 产出的 JSON 文本) / "
-            "user_text(str，用户当前这轮发言，已转写为文本)。\n"
-            "返回：一段文本形式的角色扮演回复（未来由真语音服务替换为 audio stream）。"
         ),
     )

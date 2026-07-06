@@ -18,6 +18,7 @@ from app.services.tick_lifecycle import (  # noqa: F401
     unregister_task,
     is_running,
     cancel_current_tick,
+    signal_cancel,
     cancel_burst_count,
 )
 

@@ -221,6 +221,9 @@ async def project_lifecycle(
             await mission_daemon.clear_memory(db, mission_id)
         elif action == "run_once":
             await mission_daemon.run_once(db, mission_id, payload=None)
+            # 单发 tick 收尾补消费闭环：tick 末可能有新 pending（如完整性 gate 的缺口
+            # 报告入队），没人 drain 会停摆（2026-07-03 实证）。
+            await mission_daemon.maybe_autodrain(mission_id)
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     rs = await mission_daemon.get_runtime(db, mission_id)

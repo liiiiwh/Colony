@@ -1,11 +1,7 @@
-"""ADR-028 D2 · Builder 协议硬规则：mcp_server_register 必须带 startup_command。
+"""ADR-028 D2 → ADR-031 修订：MCP 安装链从 Builder 协议**移到 MCP Installer worker**。
 
-为什么硬：登录态 MCP（xhs/知乎）的 QR 登录走 readiness human-qr 卡，readiness
-拉起 server（_spawn_and_wait）+ 探活（_fetch_qr_url）都依赖 startup_command。没它
-就无法 Popen 拉起、拿不到二维码、QR 探活落空 → 登录闭环断。
-
-run_shell 装完 → mcp_server_register(startup_command=...) → ensure_ready 的链路
-必须写进 Builder「设计 super」协议（init_db Builder protocol_md 文案）。
+Builder 不再自己 run_shell/register/ensure_ready，而是 invoke_worker(capability:mcp_installer)
+委派。startup_command / QR / install→register→ensure_ready 的硬规则现落在 Installer 协议里。
 
 纯文本断言协议源码字面量，不实跑 LLM/DB。
 """
@@ -14,35 +10,41 @@ from __future__ import annotations
 import inspect
 
 from app.db import init_db
+from app.db.system_agent_prompts import MCP_INSTALLER_PROTOCOL
 
 
 def _builder_protocol_text() -> str:
-    """从 seed_builder_project 源码里取协议字面量（含 Builder Supervisor protocol_md）。"""
     return inspect.getsource(init_db.seed_builder_project)
 
 
-def test_builder_protocol_requires_startup_command_on_register():
-    """mcp_server_register 必须带 startup_command 的硬规则文案存在。"""
+# ── Builder 侧：委派，不再自己碰 shell/MCP ──
+
+def test_builder_delegates_mcp_to_installer():
     text = _builder_protocol_text()
-    assert "startup_command" in text, "Builder 协议须提及 startup_command"
-    # 硬规则强调：必须/required/否则无法拉起
-    assert "mcp_server_register" in text
+    assert "mcp_installer" in text, "Builder 协议须委派给 mcp_installer"
+    assert "invoke_worker(capability:mcp_installer" in text, "须用 capability dispatch 委派"
 
 
-def test_builder_protocol_links_register_to_qr_probe():
-    """硬规则须说明缺 startup_command 则无法 Popen 拉起 + QR 探活。"""
-    text = _builder_protocol_text()
-    # 关键词：无法 auto-launch / Popen / QR 探活
-    assert ("auto-launch" in text or "Popen" in text or "拉起" in text), (
-        "硬规则须解释 startup_command 用于拉起 MCP server"
-    )
-    assert ("QR" in text or "二维码" in text or "qr" in text), (
-        "硬规则须把 startup_command 关联到 QR 探活/登录"
-    )
+# (Builder 实际解绑 run_shell/mcp_* 的行为由 test_adr031_mcp_installer::test_builder_unbound_from_shell_mcp_tools 在 DB 层断言。)
 
 
-def test_builder_protocol_install_then_register_then_ensure_ready_chain():
-    """run_shell 装完 → register(startup_command) → ensure_ready 的链路文案。"""
-    text = _builder_protocol_text()
-    assert "run_shell" in text
-    assert "mcp_ensure_ready" in text or "ensure_ready" in text
+# ── Installer 侧：完整安装链的硬规则现在在这里 ──
+
+def test_installer_protocol_has_full_chain():
+    p = MCP_INSTALLER_PROTOCOL
+    assert "run_shell" in p
+    assert "mcp_server_register" in p and "startup_command" in p
+    assert "agent_mcp_bind" in p
+    assert "mcp_ensure_ready" in p
+
+
+def test_installer_protocol_links_startup_command_to_qr():
+    p = MCP_INSTALLER_PROTOCOL
+    assert "startup_command" in p
+    assert ("QR" in p or "二维码" in p or "qr" in p)
+
+
+def test_installer_protocol_requires_consent_first():
+    """安装前先 request_approval 征得同意（shell 门据此放行 — ADR-030）。"""
+    p = MCP_INSTALLER_PROTOCOL
+    assert "request_approval" in p

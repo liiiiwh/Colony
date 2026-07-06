@@ -92,6 +92,9 @@ async def create_mcp_server(db: AsyncSession, payload: MCPServerCreate) -> MCPSe
         url=payload.url,
         headers=payload.headers,
         is_enabled=payload.is_enabled,
+        # 修 mission-7a9afb：原漏传 → startup_command 恒 None → 本地 MCP 无法 auto-launch + readiness 假 ready
+        startup_command=payload.startup_command,
+        startup_cwd=payload.startup_cwd,
     )
     db.add(server)
     await db.commit()

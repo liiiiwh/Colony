@@ -98,15 +98,26 @@ async def ensure_ready_for_server(
         server = await db.get(MCPServer, sid)
         poster = post_human_action or _post_and_pause
         for p in pending_human:
-            await poster(db, mission_id, server, p)
+            # poster 返回 fetch_error（如缺浏览器）→ 回填 res，让 installer 读到自愈依赖再重试。
+            err = await poster(db, mission_id, server, p)
+            if err:
+                res.setdefault("fetch_errors", []).append({"id": p.get("id"), "error": err})
     return res
 
 
-async def _post_and_pause(db, mission_id, server: MCPServer, requirement: dict) -> None:
-    """建人类残留卡（复用 approval 通道）+ 把项目暂停（readiness: 前缀）。"""
+async def _post_and_pause(db, mission_id, server: MCPServer, requirement: dict) -> str | None:
+    """建人类残留卡（复用 approval 通道）+ 把项目暂停（readiness: 前缀）。
+
+    返回 QR 拉取错误（如缺浏览器）供上游回填；无错返回 None。
+    """
     qr_url = None
+    qr_err = None
     if requirement.get("kind") == "human-qr":
-        qr_url = await _fetch_qr_url(server)
+        qr_url, qr_err = await fetch_qr(server)
+        # 错误不吞：拉不到 QR（如缺浏览器）→ 记进 requirement 供上游 installer 自愈；卡也说明。
+        if qr_err:
+            requirement = {**requirement, "fetch_error": qr_err}
+            logger.warning("[readiness] QR 拉取失败 server=%s：%s", server.name, qr_err)
     card = build_human_action_card(requirement, server_name=server.name, qr_image_url=qr_url)
     # 幂等：同项目已有同标题的 pending 卡 → 不重复发（re-finalize / re-probe 不刷屏）
     try:
@@ -140,32 +151,47 @@ async def _post_and_pause(db, mission_id, server: MCPServer, requirement: dict) 
             proj.lifecycle_status = "paused_waiting_capability"
             proj.paused_reason = f"readiness:{server.name}:{requirement['id']} 需人工介入（{requirement['kind']}）"
             await db.commit()
-            # ADR-028 D4 · H1 · 缺能力/扫码人工门落卡 → 硬停当前 tick（cooperative；幂等）。
+            # ADR-028 D4 · H1 · 缺能力/扫码人工门落卡 → **只发协作取消信号**。
+            # 本函数可能在 tick 的 tool 子 task 里执行，硬 cancel 自己 = 死锁 + 深 gather
+            # 链 RecursionError 僵尸（见 pending_approval_service._pause_for_pending 注释）。
             try:
                 from app.services import super_inbox
-                await super_inbox.cancel_current_tick(_pid2)
+                super_inbox.signal_cancel(_pid2)
             except Exception:  # noqa: BLE001
-                logger.exception("[readiness] H1 cancel_current_tick 失败（不阻塞）")
+                logger.exception("[readiness] H1 signal_cancel 失败（不阻塞）")
     except Exception:  # noqa: BLE001
         logger.exception("[readiness] 暂停项目失败")
+    return qr_err
 
 
-async def _fetch_qr_url(server: MCPServer) -> str | None:
-    try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
+async def _qr_via_mcp(server: MCPServer):
+    """连 MCP 调 get_login_qrcode 拿原始返回（可抛异常，由 fetch_qr 捕获成结构化错误）。"""
+    from langchain_mcp_adapters.client import MultiServerMCPClient
 
-        client = MultiServerMCPClient(
-            {server.name: {"url": server.url, "transport": "streamable_http",
-                           "headers": server.headers or {}}}
-        )
-        tools = await client.get_tools()
-        t = next((x for x in tools if x.name.endswith("get_login_qrcode")), None)
-        if t is None:
-            return None
-        res = await t.ainvoke({})
-        return _extract_qr_image(res)
-    except Exception:  # noqa: BLE001
+    client = MultiServerMCPClient(
+        {server.name: {"url": server.url, "transport": "streamable_http",
+                       "headers": server.headers or {}}}
+    )
+    tools = await client.get_tools()
+    t = next((x for x in tools if x.name.endswith("get_login_qrcode")), None)
+    if t is None:
         return None
+    return await t.ainvoke({})
+
+
+async def fetch_qr(server: MCPServer) -> tuple[str | None, str | None]:
+    """拉登录二维码 → 返回 (data_uri_or_https_url, error)。
+
+    错误**不吞**：MCP 工具报的运行时错误（如"can't find a browser binary"）原样返回，
+    供上游 installer 读到后 run_shell 装依赖再重试（通用依赖自愈，不是 QR 特例）。
+    """
+    try:
+        res = await _qr_via_mcp(server)
+        if res is None:
+            return None, None
+        return _extract_qr_image(res), None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def _extract_qr_image(res) -> str | None:

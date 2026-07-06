@@ -41,10 +41,10 @@ async def seed_builtin_skills(db: AsyncSession) -> None:
     """播种内置 Skill 元数据（tool_builtin 类型，is_builtin=True）。
 
     已存在（按 slug）的条目做轻量 upsert：更新 name / description / builtin_ref。
-    元数据中已删除的旧 slug（"孤儿"）会自动 `is_enabled=False`，避免：
-    - 老 agent 绑定指向无注册工厂的 builtin_ref，运行时静默掉工具
-    - 前端 Skills 列表展示已废弃工具误导管理员
-    （是否物理删除孤儿 Skill 由管理员从 UI 操作；自动只下架，保 data 安全。）
+    元数据中已删除的旧 slug（"孤儿"）**物理删除**（绑定靠 FK CASCADE 清）：
+    builtin 行的唯一真相源是代码注册表，代码里没有 = 无工厂可执行 = 纯死数据；
+    留着只会让老 agent 的绑定运行时静默缺工具 + Skills 列表误导管理员。
+    （2026-07 绿地清理：由"自动下架躺列表"改为物理删。自定义 is_builtin=False 不受影响。）
     """
     from app.skills_builtin.registry import BUILTIN_SKILL_METADATA
     from app.skills_builtin.skill_scope import resolve_skill_scope
@@ -91,23 +91,26 @@ async def seed_builtin_skills(db: AsyncSession) -> None:
             )
             created += 1
 
-    # 自动下架已不在 metadata 中的孤儿
-    deactivated = 0
+    # 物理删除已不在 metadata 中的孤儿（绑定显式删——DB FK 也有 CASCADE，此处不依赖方言）
+    from app.models.agent import AgentSkill as _AgentSkill
+    from sqlalchemy import delete as _sql_delete
+
+    purged = 0
     for slug, s in existing.items():
-        if slug not in metadata_slugs and s.is_enabled:
-            s.is_enabled = False
-            deactivated += 1
+        if slug not in metadata_slugs:
+            await db.execute(_sql_delete(_AgentSkill).where(_AgentSkill.skill_id == s.id))
+            await db.delete(s)
+            purged += 1
             logger.warning(
-                "⚠️ 内置 Skill %s (builtin_ref=%s) 已不在 metadata，自动下架；"
-                "如老 agent 仍绑定它，运行时该工具会静默缺失",
+                "🗑️ 内置 Skill %s (builtin_ref=%s) 已不在 metadata，物理删除（含其绑定）",
                 slug, s.builtin_ref,
             )
 
-    if created or updated or deactivated:
+    if created or updated or purged:
         await db.commit()
         logger.info(
-            "✅ 内置 Skill 播种：新增 %d / 更新 %d / 自动下架 %d",
-            created, updated, deactivated,
+            "✅ 内置 Skill 播种：新增 %d / 更新 %d / 物理删孤儿 %d",
+            created, updated, purged,
         )
 
 
@@ -165,6 +168,9 @@ async def seed_builder_project(db: AsyncSession) -> None:
         APPROVAL_JUDGE_PROTOCOL,
         APPROVAL_JUDGE_SOUL,
         APPROVAL_JUDGE_SOUL_ZH,
+        MCP_INSTALLER_NAME,
+        MCP_INSTALLER_PROTOCOL,
+        MCP_INSTALLER_SOUL,
     )
     from app.db.system_agent_prompts import soul_for as _soul_for
     from app.domain.onboarding.seed_language import get_seed_language as _get_seed_lang
@@ -262,30 +268,36 @@ async def seed_builder_project(db: AsyncSession) -> None:
             "   ⚠️ The super's protocol_md **must** use the §0 propose-confirm + §1 operations-loop template below (keep the A/B/C/D state machine verbatim); "
             "**never** give a super a `request_structured_input` form-style onboarding (the §2.0.1-style \"operations-parameters confirmation\" is deprecated and will make the super hang waiting on a form). "
             "Positioning is always done via \"propose-confirm\".\n"
-            "5.5 **General readiness flow for local-server-type MCP** (only when the plan needs it, e.g. Xiaohongshu/Zhihu publishing; all MCP tools follow this):\n"
-            "   ① `request_approval(title='Install third-party component X?', message=<source repo + suggested vetted tag + risk notes>, "
-            "options=['Approve install','Use a plan that doesn\\'t depend on it','Give up'])` —— **getting the user's consent to install is the key human checkpoint**.\n"
-            "   ② After approval → `run_shell` to install+compile+start per that skill's SETUP.md (missing toolchain / can't install → **report the error faithfully and have the user fix the environment, don't paper over it**). "
-            "The backend image already ships **git + go + node/npm** (ADR-028 D2 platform-side MCP runtime), so `git clone` + `go build` + `npm` run in-container; the third-party MCP process runs **on the platform side**, no separate machine.\n"
-            "   ③ **HARD RULE (ADR-028 D2)**: `mcp_server_register(..., startup_command=<the exact command that launches the server>)` —— "
-            "**startup_command is REQUIRED, never register an MCP server without it**. The platform uses startup_command to **`Popen` auto-launch** the server and, for login-type MCP (xhs/Zhihu), to keep it alive while readiness fetches the **QR-code (二维码) for the human-qr login card**. "
-            "Register without startup_command → can't `Popen` 拉起 the process → QR 探活 (probe) gets nothing → the login loop breaks and the super hangs forever. "
-            "Then `agent_mcp_bind` to bind it to the worker that uses it, and `mcp_ensure_ready` / `ensure_ready` to drive it to readiness. "
-            "**Install→register(with startup_command)→ensure_ready** is the one correct chain.\n"
-            "   ④ **QR-scan/login steps are not done here** —— leave them to the super during operations to pop a human-qr card in its own session (ADR-012 R3 / ADR-028 D2; the super has no run_shell, installation can only be done at build time). "
-            "readiness 用 startup_command 拉起 server + 抓二维码 → human-qr 卡 → 用户扫码 → 决卡 re-probe → resume 被卡的 super（ADR-028 D4 H2 统一 paused_for_human resume）。\n"
+            "5.5 **INSTALL-FIRST — get the third-party infrastructure ready BEFORE you build the workers that need it.**\n"
+            "   Order matters: a worker whose capability depends on an MCP/skill that isn't installed + logged-in is dead on arrival "
+            "(can't call its tools), and if you build workers first you tend to forget the install and ship a broken super (real bug). "
+            "So for **every** capability in your plan that needs a ClawHub skill or a local MCP/service:\n"
+            "   **(i) DELEGATE the install to the MCP Installer FIRST** — you do NOT have clawhub_install / run_shell / mcp_server_register; the installer does. "
+            "Call `invoke_worker(capability:mcp_installer, goal={install:'<ClawHub slug OR git repo + build/start hint>', target_project_id:'<the new super\\'s mission id>'})`. "
+            "The installer runs its own chain (run_shell install+launch → mcp_server_register(with startup_command) → mcp_ensure_ready incl. **QR login shown in target_project_id's session**) "
+            "and returns `{mcp_server_id | skill_slug, ready, awaiting_user}`. It does **NOT** bind to any worker and does **NOT** need a worker to exist yet — that's the whole point of install-first. "
+            "Don't wrap the delegation in your own request_approval (the plan was already confirmed — a second approval just loops).\n"
+            "   **(ii) THEN `agent_create` the workers** (each with its `capability` slug).\n"
+            "   **(iii) THEN bind the now-ready infrastructure to its worker YOURSELF — this step is MANDATORY, not optional**: "
+            "for **every** worker whose capability uses that MCP/skill call `agent_mcp_bind(agent_id=<worker>, mcp_server_id=<from installer>)` for a local MCP, "
+            "or `skill_bind(agent_id=<worker>, slug=<returned skill_slug>)` for a ClawHub skill. You own binding now (you have agent_mcp_bind + skill_bind); the installer never binds. "
+            "⚠️ **A worker created but not bound to the MCP it needs is dead — it can't call any of the MCP's methods** (the exact bug users hit: \"bound the skill but the worker can't use its methods\"). "
+            "The finalize gate now **hard-checks this**: an installed+registered MCP that is bound to **zero** workers → the build is rejected as incomplete and bounced back to you to bind. So never skip the bind.\n"
+            "   The installer returns FAST with `ready:false, awaiting_user='qr-scan'` (that's expected — the platform drives the QR login later at finalize). Do not wait for the scan; proceed immediately to build the workers + **bind** using the returned `mcp_server_id`.\n"
+            "   ⚠️ **Completeness**: build a worker for **every** capability in your plan's roster and bind every dependency. Do not `mission_create`/wrap up until each planned capability has a real worker and each MCP/skill dependency is installed + bound — "
+            "the platform also hard-checks this at finalize and will refuse to activate an incomplete super, bouncing it back to you to finish.\n"
             "6. `mission_create(name, slug, supervisor_agent_id=<new super>)` —— **at this point your build is wrapping up, end this turn**:\n"
             "   - **Decide scheduling by scenario (you must judge — the platform NO LONGER force-adds a default tick):**\n"
             "       · **Periodic/proactive** (SRE patrol, daily report, scheduled posting, monitoring) → **you must** `schedule_create(mission_id, kind='cron'|'interval', expr=...)` in this same turn, else it won't run autonomously.\n"
             "       · **Event/on-demand** (review a contract when uploaded, answer a question when asked, process an inbound ticket) → **do NOT create a schedule** — leave it event/message-driven; a periodic cron would just burn LLM ticking with nothing to do.\n"
             "   - **No need** to manually `activate_super_first_run` / set origin_session_id / set the approval channel —— "
-            "after this turn ends the platform **automatically and deterministically finalizes**: ensure_ready has bound MCP + activated the super's first run (one kickoff) + the \"Enter super\" button + writing origin_session_id. **Scheduling is yours to decide above.**\n"
+            "after this turn ends the platform **automatically and deterministically finalizes**: it verifies the build is complete (every planned capability has a worker + its deps bound), "
+            "activates the super's first run (one kickoff) + the \"Enter super\" button + writes origin_session_id. If the build is incomplete it will NOT activate — it bounces back so you finish it. **Scheduling is yours to decide above.**\n"
             "   - slug collision (SLUG_TAKEN) → change the slug and retry.\n"
             "   ⚠️ **Never ask about account positioning at build time** (niche/style/audience) —— that belongs to super soul §0, proposed-confirmed in its own session. "
             "You are only responsible for 'propose the plan → build super+project → platform auto-activates'.\n\n"
             "## 🔧 Quick self-resolve loop (ADR-012 R5 · when you receive a capability_gap / worker_health escalation)\n"
-            "Prefer to **fix it yourself**, don't immediately ask for help: missing tool / service not started / need to install a package / format conversion → use `run_shell` / `clawhub_install` / "
-            "`mcp_ensure_ready` to auto-fix → `resume_super_agent` to resume. Only when it truly can't be automated (needs the user to scan a QR / a key / payment / "
+            "Prefer to **fix it yourself**, don't immediately ask for help: anything that needs installing (ClawHub skill / MCP / local service) → **delegate** `invoke_worker(capability:mcp_installer, goal={install, target_project_id})` (it installs + registers + logs in the infra, does NOT bind), then bind it yourself (`agent_mcp_bind` for a local MCP / `skill_bind` for a skill), then `resume_super_agent` to resume. Only when it truly can't be automated (needs the user to scan a QR / a key / payment / "
             "an offline action) do you `request_approval` to ask a human. Goal: the user doesn't have to wait for an engineer to change code, the system resolves it itself.\n\n"
             "**super.protocol_md standard template** (must contain §1 standard loop):\n"
             "```markdown\n"
@@ -416,13 +428,12 @@ async def seed_builder_project(db: AsyncSession) -> None:
             "3. 在 DESIGN_SUPER 建造阶段，每个图像 worker `agent_create` 之后用 `agent_aux_model_bind(agent_id, model=<list_models(model_type='image') 拿到的真实 model_id>, role='image', alias='text2img'(文生图)/'img2img'(改图)，可多绑)` 绑定，**绝不写死任何模型**；批量生成多图让 worker 用 `parallel_invoke_aux_model`\n"
             "4. When persisting to workspace, the worker protocol explicitly writes `artifact_type='image'` (image URL) —— the frontend chooses the renderer by this\n"
             "5. **No video**: by default no video worker is designed for the project / no video aux_model is bound (the user explicitly said no for now)\n\n"
-            "## Local MCP server fault self-heal (project plan design point)\n"
-            "If the plan includes a **local http MCP** (like xhs-mcp / weibo-mcp where the user starts a binary on their own machine):\n"
-            "1. When proposing the plan, **ask clearly** for the binary path / startup port (collect with `request_approval(title='Local MCP server startup config', "
-            "message=<ask for the binary full path + port + cwd>, options=['/path/to/...', 'Change path', 'Use stdio mode instead'])`), "
-            "   and fill these into the spec's mcp.startup_command + mcp.startup_cwd.\n"
-            "2. **Every worker that uses MCP automatically binds `mcp_server_restart`** —— the spec's skill list must include it.\n"
-            "3. For stdio-mode MCP (command field) you **do not need** startup_command —— langchain-mcp-adapters spawns it itself.\n\n"
+            "## Local MCP (xhs-mcp / weibo-mcp …) → install-first, delegate install to MCP Installer (ADR-031 · 2026-07-03)\n"
+            "You do NOT install/launch/register local MCPs yourself. **Install-first**: BEFORE building the worker that needs it, "
+            "`invoke_worker(capability:mcp_installer, goal={install, target_project_id})` — it does install+startup_command+register+login(QR) in its own context and returns `{mcp_server_id, ready}`. "
+            "It does **not** bind. THEN create the worker and bind yourself: `agent_mcp_bind(agent_id=<worker>, mcp_server_id=<from installer>)`. "
+            "Bind `mcp_server_restart` to workers that use the MCP (so they can re-launch it at runtime). "
+            "In your plan, name which MCP + which worker uses it — installer provisions, you bind.\n\n"
             "## Hard constraints\n"
             "- **E1**: at most 1 `request_approval` per turn, end the turn immediately after calling it\n"
             "- **E2**: dangerous operations (`mission_delete` / `clear_memory` / `mission_apply_changes(clear_memory=True)`) must be approved first\n"
@@ -464,6 +475,46 @@ async def seed_builder_project(db: AsyncSession) -> None:
                                 "context": "str",
                             },
                             "output_schema": {"must_human": "bool", "reason": "str"},
+                        }
+                    ],
+                }
+            },
+        ),
+        # ── ADR-031 · 系统级 MCP Installer worker（capability dispatch；不挂 mission）──
+        # 把「装第三方 MCP」的 LLM 多步流程从 Builder 上下文剥出：Builder 只 invoke_worker(
+        # capability:mcp_installer)，它在自己上下文里跑完 clone+build+启动+register+bind+QR。
+        # kind='worker' 故 invoke_worker(_resolve_worker) 能解析（同 approval_judge）；shell/MCP
+        # 技能在下方显式绑（seed 系统 agent 走显式绑定，不靠 scope 自动绑）。
+        _agent_spec(
+            MCP_INSTALLER_NAME,
+            "installer",
+            MCP_INSTALLER_SOUL,
+            MCP_INSTALLER_PROTOCOL,
+            wk_model,
+            produces_deliverable=False,
+            kind="worker",
+            capability="mcp_installer",
+            extra_config={
+                "capability_contract": {
+                    "capability": "mcp_installer",
+                    "version": "1.0",
+                    "advertises": [
+                        {
+                            "action": "install_mcp",
+                            # 不在此设 per-invoke 审批门：安装同意=build 方案确认（已批），
+                            # shell gate(ADR-030) 据此放行；再设 True 会让 Builder 二次 request_approval 死循环。
+                            "requires_approval": False,
+                            "side_effects": ["shell_exec", "process_spawn"],
+                            "input_schema": {
+                                "mcp": "str (clawhub slug 或 git repo + build/start 说明)",
+                                "bind_to_agent_id": "str (要绑 MCP 的 worker)",
+                                "target_project_id": "str (登录/QR 卡落到的 mission)",
+                            },
+                            "output_schema": {
+                                "mcp_server_id": "str",
+                                "ready": "bool",
+                                "awaiting_user": "str|null",
+                            },
                         }
                     ],
                 }
@@ -563,8 +614,10 @@ async def seed_builder_project(db: AsyncSession) -> None:
                         a.protocol_md = spec["protocol_md"]
                 # ADR-028 D1 · approval_judge 的 capability_contract 是 dispatch 必需的结构性
                 # 字段（缺它 super 无法 invoke_worker）→ 缺失时补齐，保留 admin 其他 extra_config key。
-                if "extra_config" in spec and not (a.extra_config or {}).get(
-                    "capability_contract"
+                # force_sync 时**覆盖** capability_contract（如 requires_approval 变更）；
+                # 否则仅在缺失时补齐（保留 admin 改动）。
+                if "extra_config" in spec and (
+                    force_sync or not (a.extra_config or {}).get("capability_contract")
                 ):
                     a.extra_config = {
                         **(a.extra_config or {}),
@@ -601,8 +654,14 @@ async def seed_builder_project(db: AsyncSession) -> None:
         "agent_create", "agent_update",  # agent_update 用来覆写 supervisor protocol
         "agent_aux_model_bind",  # DESIGN_SUPER 建出图 worker 后直接绑图像/aux 模型（关键功能修复）
         "skill_bind", "skill_unbind",
-        "mcp_server_register", "agent_mcp_bind",  # 2026-05-20 N3.2 新增（MCP 类 skill 必备）
-        "mcp_ensure_ready", "run_shell",  # ADR-010：注册 MCP 后拉到就绪（自动起服务/补登录卡）
+        # install-first（2026-07-03 grill C/a）：installer 只把 MCP/skill 基础设施装好登录好、**不绑**；
+        # Builder 建完 worker 后自己把就绪能力接到 worker → 需要 agent_mcp_bind。安装/shell 仍只属
+        # installer（run_shell / mcp_server_register / mcp_ensure_ready **不**给 Builder）。
+        "agent_mcp_bind",
+        # ADR-031 · MCP 安装/注册/就绪委派给 mcp_installer worker（Builder 不碰 shell/安装/register）。
+        # 但委派本身需要 invoke_worker（曾漏绑——全靠 reconcile 糊上；is_system 豁免回填后断供，
+        # Builder 建 MCP super 时退化成"让用户手动装"）。
+        "invoke_worker",
         "activate_super_first_run",  # ADR-011：建完激活 super 首跑 + 挂中继
         # 微信 Clawbot 审批渠道（2026-05-20 新增；让 supervisor 引导用户扫码绑微信审批人）
         "clawbot_login_start", "clawbot_login_confirm",
@@ -630,7 +689,17 @@ async def seed_builder_project(db: AsyncSession) -> None:
     ]
     # 查全部下面会用到的 skill（避免 _bind 静默 skip）
     # （agent_aux_model_bind 已在 builder_skill_slugs 里；这里补 Supervisor 直接调的 smoke test）
-    _all_needed_slugs = set(builder_skill_slugs) | {
+    # ADR-031 · MCP Installer worker 的专注技能集（显式绑；seed 系统 agent 不走 scope 自动绑）。
+    mcp_installer_skill_slugs = [
+        "request_approval",            # ①征得安装同意（shell 门据此放行 — ADR-030）
+        "run_shell",                   # ②clone+build+启动本地 MCP server
+        "clawhub_search", "clawhub_inspect", "clawhub_install", "clawhub_list_installed",
+        "mcp_server_register",         # ③注册（带 startup_command）
+        "agent_mcp_bind",              # ④绑给目标 worker
+        "mcp_ensure_ready",            # ⑤探活 + QR 卡
+        "memory_append",               # 记录
+    ]
+    _all_needed_slugs = set(builder_skill_slugs) | set(mcp_installer_skill_slugs) | {
         "mission_run_test",
     }
     skill_rows = await db.execute(
@@ -662,6 +731,28 @@ async def seed_builder_project(db: AsyncSession) -> None:
     # Supervisor 也能直接调 smoke test（建完直接自测，不再有 Tester worker）
     await _bind(sup, "mission_run_test")
 
+    # ADR-031 · 给 MCP Installer worker 绑它的专注技能集（run_shell + mcp_* + clawhub_* + 审批）
+    _installer = agents.get(MCP_INSTALLER_NAME)
+    if _installer is not None:
+        for slug in mcp_installer_skill_slugs:
+            await _bind(_installer, slug)
+
+    # ADR-031 · 从 Builder **解绑**已委派给 installer 的 MCP 执行类技能（_bind 只加不删；存量库
+    # 里 Builder 仍留着旧绑定 → 必须显式 unbind，否则 Builder 仍能自己 run_shell/装 MCP，委派形同虚设）。
+    # install-first（2026-07-03）：agent_mcp_bind 移出解绑列表——Builder 现在自己绑（见 builder_skill_slugs）。
+    # 仍解绑安装/shell 类（那是 installer 专属）。
+    _builder_deprecated_skills = ["run_shell", "mcp_server_register", "mcp_ensure_ready"]
+    _dep_rows = (await db.execute(
+        select(Skill.id).where(Skill.slug.in_(_builder_deprecated_skills))
+    )).scalars().all()
+    if _dep_rows:
+        await db.execute(
+            AgentSkill.__table__.delete().where(
+                AgentSkill.agent_id == sup.id,
+                AgentSkill.skill_id.in_(_dep_rows),
+            )
+        )
+
     # 5. Builder super 没有 standing mission —— 设计会话由用户在 /super/builder 点「+新建」
     #    按需创建（每场景一个独立设计会话，supervisor=Builder Supervisor）。
     #    存量库的 standing slug='builder' mission 已在函数开头被 cascade 删除。
@@ -673,6 +764,10 @@ async def seed_builder_project(db: AsyncSession) -> None:
     _judge = agents.get(APPROVAL_JUDGE_NAME)
     if _judge is not None:
         _judge.is_system = True
+    # ADR-031 · MCP Installer 同为系统对象（不可删）
+    _installer_agent = agents.get(MCP_INSTALLER_NAME)
+    if _installer_agent is not None:
+        _installer_agent.is_system = True
 
     await db.commit()
     logger.info(
@@ -690,6 +785,9 @@ async def reconcile_scoped_skill_bindings(db: AsyncSession) -> int:
 
     规则：scope='all'→所有 agent；'super'→所有 super；'worker'→所有 worker。
     'builder'-scoped 不在此处理（由 builder factory_bindings 显式绑给 builder 一个）。
+    **is_system agent 全程豁免**（回填与 prune 都跳过）：系统 agent（Builder Supervisor /
+    Approval Judge / MCP Installer 等）的技能集只认 seed 的显式绑定——否则装个 clawhub
+    发布件会被 worker-scope 回填糊到审批判官头上（2026-07 真出过）。
     """
     from app.models.agent import Agent, AgentSkill
     from app.models.skill import Skill
@@ -714,16 +812,10 @@ async def reconcile_scoped_skill_bindings(db: AsyncSession) -> int:
     )).scalars().all()
     scope_by_skill = {str(s.id): s.scope for s in skills}
     agents = (await db.execute(
-        _sel(Agent.id, Agent.kind).where(Agent.kind.in_(("super", "worker")))
-    )).all()
-    # builder 的 supervisor（meta-super）不参与 prune，避免误删它的编排件。
-    # Builder super 已无 standing mission，按 agent 身份（slug='builder' 的 builder super）识别，
-    # 不再依赖 slug='builder' 的 mission 行存在。
-    builder_sup = (await db.execute(
-        _sel(Agent.id).where(
-            Agent.kind == "super", Agent.category == "builder", Agent.slug == "builder"
+        _sel(Agent.id, Agent.kind).where(
+            Agent.kind.in_(("super", "worker")), Agent.is_system.is_(False)
         )
-    )).scalar_one_or_none()
+    )).all()
     existing_pairs = {
         (str(aid), str(sid))
         for aid, sid in (await db.execute(_sel(AgentSkill.agent_id, AgentSkill.skill_id))).all()
@@ -744,8 +836,9 @@ async def reconcile_scoped_skill_bindings(db: AsyncSession) -> int:
         await db.commit()
 
     # PRUNE · super=项目经理只统筹：从 super 上摘掉 worker-scoped 执行技能（xiaohongshu-mcp 等）。
+    # （agents 已排除 is_system——Builder Supervisor 等系统 super 天然不参与 prune。）
     pruned = 0
-    super_ids = [aid for aid, kind in agents if kind == "super" and aid != builder_sup]
+    super_ids = [aid for aid, kind in agents if kind == "super"]
     if super_ids:
         rows = (await db.execute(
             _sel(AgentSkill).where(AgentSkill.agent_id.in_(super_ids))
@@ -827,6 +920,13 @@ async def run_platform_install(db: AsyncSession) -> dict:
     except Exception:
         logger.exception("seed mission.empty_goal_prompt 失败（不影响启动）")
         steps["mission_empty_goal_prompt"] = "failed"
+    # ADR-030 · shell 安全门提示词，admin 在系统设置可改（幂等 DO NOTHING）。
+    try:
+        await seed_shell_judge_prompt(db)
+        steps["shell_judge_prompt"] = "ok"
+    except Exception:
+        logger.exception("seed shell_judge.system_prompt 失败（不影响启动）")
+        steps["shell_judge_prompt"] = "failed"
     # 置 is_install=1（value 为 JSONB）
     try:
         from sqlalchemy import text as _sql_text
@@ -873,6 +973,35 @@ async def seed_mission_empty_goal_prompt(db: AsyncSession) -> None:
             "INSERT INTO system_settings (key, value, description) "
             "VALUES (:k, CAST(:v AS jsonb), :d) ON CONFLICT (key) DO NOTHING"
         ), {"k": key, "v": _json.dumps(MISSION_EMPTY_GOAL_PROMPT_DEFAULT), "d": desc})
+    await db.commit()
+    from app.core import system_settings as _ss
+    _ss.invalidate()
+
+
+async def seed_shell_judge_prompt(db: AsyncSession) -> None:
+    """ADR-030 · 幂等 seed shell 安全门提示词到 system_settings，使其在 admin「系统设置」可编辑。
+    值取 shell_judge.JUDGE_DEFAULT_SYSTEM_PROMPT（单一真相源，无 drift）；ON CONFLICT DO NOTHING
+    不覆盖 admin 已改的值。DB 行缺失时 run_shell 仍回落代码默认，故此 seed 失败不致命。"""
+    import json as _json
+
+    from sqlalchemy import text as _sql_text
+
+    from app.core.system_settings import SHELL_JUDGE_PROMPT_KEY
+    from app.services.shell_judge import JUDGE_DEFAULT_SYSTEM_PROMPT
+
+    key = SHELL_JUDGE_PROMPT_KEY
+    desc = "run_shell 安全门（LLM 判官）的系统提示词；喂入本任务已核实用户审批后，已批准操作会放行。留空=用内置默认。"
+    is_sqlite = db.bind is not None and db.bind.dialect.name == "sqlite"
+    if is_sqlite:
+        await db.execute(_sql_text(
+            "INSERT INTO system_settings (key, value, description) "
+            "VALUES (:k, :v, :d) ON CONFLICT (key) DO NOTHING"
+        ), {"k": key, "v": JUDGE_DEFAULT_SYSTEM_PROMPT, "d": desc})
+    else:
+        await db.execute(_sql_text(
+            "INSERT INTO system_settings (key, value, description) "
+            "VALUES (:k, CAST(:v AS jsonb), :d) ON CONFLICT (key) DO NOTHING"
+        ), {"k": key, "v": _json.dumps(JUDGE_DEFAULT_SYSTEM_PROMPT), "d": desc})
     await db.commit()
     from app.core import system_settings as _ss
     _ss.invalidate()

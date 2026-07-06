@@ -61,15 +61,32 @@ class _DaemonEntry:
 _DAEMONS: dict[uuid.UUID, _DaemonEntry] = {}
 _DAEMON_LOCK = asyncio.Lock()
 
-# 正在跑 tick 的 mission（防并发 run_once）。单事件循环里 check+add 之间无 await → 原子。
-# 并发再触发 run_once（手动「运行一次」赶上 scheduler/kickoff，或前端重复点）时直接 no-op，
-# 而不是两个 tick 同时改 super/run_state 撞库 → 500。
-_TICKING_MISSIONS: set[uuid.UUID] = set()
+# 正在跑 tick 的 mission → 加锁时刻 monotonic（防并发 run_once）。单事件循环里
+# check+set 之间无 await → 原子。并发再触发 run_once 时直接 no-op skipped。
+# 值是时间戳：锁持有超过 _TICK_LOCK_STALE_SEC = 僵尸（2026-07-03 事故：tick task 被
+# 半途炸掉的 cancel 弄成永久挂起，finally 永远不跑 → 锁永久持有 → mission 挂死），
+# run_once 判僵尸后抢锁自愈。
+_TICKING_MISSIONS: dict[uuid.UUID, float] = {}
+# 僵尸判定阈值：正常 tick 墙钟上限 + 充分余量（收尾/落库）。
+_TICK_LOCK_STALE_SEC = TICK_WALLCLOCK_CAP_SEC + 300
 
 
 # 心跳 sweeper：一个全局后台任务，遍历所有注册的 daemon 并 bump 心跳。
 # 启动期 reconcile 之后才创建；shutdown 时取消。
 _HEARTBEAT_SWEEPER_TASK: asyncio.Task | None = None
+
+# fire-and-forget 后台任务的强引用 registry（2026-07-03 实证：无引用的 create_task
+# 会被 GC **静默吞掉**——drain tick 跑到一半消失，finalize/收尾全没执行、零日志零异常。
+# Python 文档明示必须保存 create_task 返回值）。done 后自动清出，防泄漏。
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro, *, name: str) -> asyncio.Task:
+    """create_task + 持强引用 + done 自清。所有 fire-and-forget 都必须走这里。"""
+    t = asyncio.create_task(coro, name=name)
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    return t
 
 
 async def _heartbeat_sweep_pass(
@@ -283,7 +300,7 @@ async def start(db: AsyncSession, mission_id: uuid.UUID, *, kickoff: bool = Fals
                     _rs = await _get_or_create_run_state(db, mission_id)
                     if (_rs.run_count or 0) == 0:
                         import asyncio as _asyncio
-                        _asyncio.create_task(_initial_kickoff(mission_id), name=f"kickoff-{mission_id}")
+                        _spawn_bg(_initial_kickoff(mission_id), name=f"kickoff-{mission_id}")
                         logger.info("[daemon %s] 首次激活 → 安排 kickoff tick", mission_id)
                 except Exception:
                     logger.exception("[daemon %s] kickoff 安排失败（不阻塞 start）", mission_id)
@@ -310,6 +327,53 @@ async def _initial_kickoff(mission_id: uuid.UUID) -> None:
             })
     except Exception:
         logger.exception("[daemon %s] initial kickoff tick 失败", mission_id)
+
+
+async def _drain_kickoff(mission_id: uuid.UUID) -> None:
+    """drain 接力：消费 pending 队列的一轮 tick（消息 run_once 内自取，payload 不带正文）。
+
+    收尾再查一次 pending：还有货且 lifecycle 可消费 → 链式安排下一轮（每链一环 = 一整个
+    tick，天然限速；gate 的 build_incomplete 入队有 3 次上限，不会无限链）。
+    ⚠️ tick **失败不 re-arm**：失败是瞬时的（如启动依赖缺失直接 raise），re-arm = 无退避
+    热循环（2026-07-03 生产实证 9717 次/分钟）。失败等下次 reconcile / 用户触发。"""
+    try:
+        async with _open_session() as db:
+            # reconcile idle-drain 场景：paused_idle 的 daemon 没被 reconcile start
+            # （只恢复 lifecycle=running）→ runtime=stopped，run_once 必 raise。先拉起。
+            proj = await db.get(Mission, mission_id)
+            if proj is not None and proj.runtime_status != "running":
+                await start(db, mission_id)
+            await run_once(db, mission_id, payload={
+                "trigger": "user_chat", "user_message": "",
+            })
+    except Exception:
+        logger.exception("[daemon %s] drain tick 失败（不 re-arm，等下次触发）", mission_id)
+        return
+    with suppress(Exception):
+        await maybe_autodrain(mission_id)
+
+
+async def maybe_autodrain(mission_id: uuid.UUID) -> bool:
+    """pending>0 且 lifecycle 可消费（paused_idle/running）→ 安排一轮 _drain_kickoff。
+
+    2026-07-03 实证：「运行一次」API 是单发 tick，gate 在 tick 末 enqueue 的缺口报告
+    没人消费 → 又停摆。所有「单发 tick」路径（run_once API / _drain_kickoff）收尾都该
+    调本函数补上消费闭环。返回是否安排了 drain。"""
+    from app.domain.tick_policy import should_drain_after_tick
+    from app.services import pending_queue as _pq
+
+    try:
+        async with _open_session() as db:
+            pending = await _pq.count_pending(db, mission_id)
+            proj = await db.get(Mission, mission_id)
+            ls = (proj.lifecycle_status if proj else "") or ""
+        if should_drain_after_tick(pending_count=pending, lifecycle_status=ls):
+            logger.info("[autodrain] project=%s pending=%d → 安排 drain tick", mission_id, pending)
+            _spawn_bg(_drain_kickoff(mission_id), name=f"autodrain-{mission_id}")
+            return True
+    except Exception:
+        logger.exception("[autodrain] 检查失败（不阻塞）project=%s", mission_id)
+    return False
 
 
 async def stop(db: AsyncSession, mission_id: uuid.UUID) -> str:
@@ -411,14 +475,24 @@ async def run_once(
     """单次 tick 的并发守卫薄包装：同一 mission 已有 tick 在跑时直接 **no-op**（返回 skipped），
     避免手动「运行一次」赶上 scheduler/kickoff、或前端重复点 → 两个 tick 并发撞库 → 500。
     想打断正在跑的 tick 请走 interrupt（停止），不是再发一个 run_once。"""
-    if mission_id in _TICKING_MISSIONS:
+    import time as _time
+    _now = _time.monotonic()
+    _held = _TICKING_MISSIONS.get(mission_id)
+    if _held is not None and (_now - _held) <= _TICK_LOCK_STALE_SEC:
         logger.info("[run_once] mission=%s 已有 tick 在跑 → no-op 跳过（防并发）", mission_id)
         return {"ok": True, "skipped": "tick_in_progress"}
-    _TICKING_MISSIONS.add(mission_id)
+    if _held is not None:
+        logger.warning(
+            "[run_once] mission=%s tick 锁已持有 %.0fs > %ds → 判定僵尸 tick，抢锁自愈",
+            mission_id, _now - _held, _TICK_LOCK_STALE_SEC,
+        )
+    _TICKING_MISSIONS[mission_id] = _now
     try:
         return await _run_once_body(db, mission_id, payload)
     finally:
-        _TICKING_MISSIONS.discard(mission_id)
+        # 只释放自己的锁（时间戳=token）：若期间被更新（TTL 抢锁），别弹掉新持有者。
+        if _TICKING_MISSIONS.get(mission_id) == _now:
+            _TICKING_MISSIONS.pop(mission_id, None)
 
 
 async def _run_once_body(
@@ -681,10 +755,10 @@ async def _run_once_body(
         logger.exception("[daemon %s] supervisor invoke 失败", mission_id)
         err_msg = f"invoke: {exc}"
     finally:
-        # v4 · 清掉 super_inbox 注册
+        # v4 · 清掉 super_inbox 注册（比对是本 task 的注册才 pop，防弹掉别人的）
         try:
             from app.services import super_inbox as _sib
-            _sib.unregister_task(mission_id)
+            _sib.unregister_task(mission_id, task=asyncio.current_task())
         except Exception:
             pass
 
@@ -805,6 +879,31 @@ async def reconcile_on_boot() -> None:
             )
             with suppress(Exception):
                 await start(db, proj.id)
+            # 重启接力（2026-07-03 事故后半场）：进程死时在途的续跑 tick（in-memory）全丢，
+            # 但 DB pending 队列里可能还躺着未消费消息（如审批回执）→ 不 drain 的话
+            # mission 干等到下一条用户消息。发现有货 → 安排一轮 drain tick。
+            with suppress(Exception):
+                from app.services import pending_queue as _pq
+                if await _pq.count_pending(db, proj.id) > 0:
+                    logger.warning(
+                        "[reconcile] project=%s 有未消费 pending 消息 → 安排 drain tick", proj.id
+                    )
+                    _spawn_bg(_drain_kickoff(proj.id), name=f"drain-{proj.id}")
+
+        # 1.5) paused_idle + pending>0 也要 drain（2026-07-03 gate 停摆场景：builder 被
+        # 完整性 gate 拦下后转 paused_idle，缺口报告在 pending 队列里等消费；paused_idle
+        # 不在上面 lifecycle=running 恢复集里，但 drain 策略允许 paused_idle 消费）。
+        idle_rows = await db.execute(
+            select(Mission).where(Mission.lifecycle_status == "paused_idle")
+        )
+        for proj in idle_rows.scalars().all():
+            with suppress(Exception):
+                from app.services import pending_queue as _pq2
+                if await _pq2.count_pending(db, proj.id) > 0:
+                    logger.warning(
+                        "[reconcile] project=%s paused_idle 且有 pending → 安排 drain tick", proj.id
+                    )
+                    _spawn_bg(_drain_kickoff(proj.id), name=f"drain-idle-{proj.id}")
 
         # 2) lifecycle 非 running、但 runtime 残留 running/starting/stopping 且心跳过期 → 标 error
         stale_rows = await db.execute(

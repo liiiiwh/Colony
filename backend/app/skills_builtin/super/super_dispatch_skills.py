@@ -52,6 +52,43 @@ def _get_thread_lock(super_id: str, worker_id: str) -> asyncio.Lock:
     return _ic_get_thread_lock(super_id, worker_id)
 
 
+def resolve_action_spec(cap_contract: dict, action: str) -> tuple[dict | None, str | None]:
+    """action → (spec, None) 或 (None, 错误信息)。
+
+    `execute`（goal 自然语言）是**不可废除的万能兜底**（2026-07-05 xhs_publisher 事故：
+    write_contract 把合同收窄成单 publish 并 deprecate execute → super 对 worker 绑定
+    MCP 的登录/取码/搜索/评论等方法永远没有派发通道）。worker LLM 拿到 goal 后自选
+    工具（含全部绑定 MCP 方法）。审批语义防绕过：任一 advertised action 要审批 →
+    execute 兜底同样要（approval_judge 自动裁决，安全 goal 秒批，不加人工负担）。
+    """
+    advertises = {
+        a.get("action"): a
+        for a in (cap_contract.get("advertises") or [])
+        if isinstance(a, dict)
+    }
+    spec = advertises.get(action)
+    if spec is not None:
+        return spec, None
+    if action == "execute":
+        any_approval = any(bool(a.get("requires_approval")) for a in advertises.values())
+        side_effects = sorted({
+            s for a in advertises.values() for s in (a.get("side_effects") or [])
+        })
+        return {
+            "action": "execute",
+            "input_schema": {"goal": "string", "params": "object?"},
+            "output_schema": {"result": "object"},
+            "requires_approval": any_approval,
+            "side_effects": side_effects,
+            "synthetic_fallback": True,
+        }, None
+    return None, (
+        f"不支持 action={action!r}。可用：{list(advertises.keys())[:10]}；"
+        "或用万能兜底 action='execute'（goal 写自然语言，worker 自选工具，"
+        "含其绑定 MCP 的全部方法）"
+    )
+
+
 def _get_action_lock(super_id: str, worker_id: str, action: str) -> asyncio.Lock:
     """v4.1 · per-(super, worker, action) Lock。仅当 capability_contract.advertises[*].parallel_safe=false 时启用。
 
@@ -209,18 +246,16 @@ async def _invoke_worker_inner(
                 "action": action, "super_id": str(super_id),
             })
 
-        # 2. capability_contract 校验 action + requires_approval
+        # 2. capability_contract 校验 action + requires_approval（execute 万能兜底见
+        #    resolve_action_spec —— 2026-07-05 xhs_publisher 事故：合同被收窄后 super
+        #    永远没通道用 worker 绑定 MCP 的其余方法）
         cap_contract = (worker.extra_config or {}).get("capability_contract") or {}
-        advertises = {a.get("action"): a for a in (cap_contract.get("advertises") or []) if isinstance(a, dict)}
-        action_spec = advertises.get(action)
+        action_spec, _act_err = resolve_action_spec(cap_contract, action)
         if action_spec is None:
             return {
                 "ok": False,
                 "status": "failed",
-                "error_msg": (
-                    f"❌ worker {worker.capability or worker.name} 不支持 action={action!r}。"
-                    f"可用：{list(advertises.keys())[:10]}"
-                ),
+                "error_msg": f"❌ worker {worker.capability or worker.name} {_act_err}",
             }
         # V27/V33 approval gate
         if action_spec.get("requires_approval") and not approval_ticket:
@@ -434,6 +469,19 @@ async def _invoke_worker_inner(
     envelope.setdefault("action", action)
     envelope.setdefault("ts", time.time())
 
+    # 9.5 · 把 worker 本次的**中间过程**（thinking / tool-call / tool-result）落到 worker 线程，
+    # 让用户点进 super↔worker 线程能看到「worker 到底想了什么、调了哪些工具、结果如何」，
+    # 而不只是最终 envelope（否则调试/审计如本轮 run_shell 报错都看不见）。用与 daemon 流式
+    # 一致的 meta 形状（event_type=tool-input-available/tool-output-available + raw），前端
+    # missionTimeline 直接重建工具卡。非阻塞。（不改上面的 ainvoke 热路径，只事后落 msgs 轨迹。）
+    try:
+        await __persist_worker_trace(
+            ctx.db_factory, ctx.mission_id, _worker_thread_key,
+            msgs, len(input_msgs), str(worker_id),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("[invoke_worker] persist worker trace failed（不阻塞）")
+
     # 10. 写 worker 输出回 thread（assistant role）便于下次 invoke 看到 (V38 size guard)
     try:
         async with ctx.db_factory() as db3:
@@ -465,6 +513,50 @@ async def _invoke_worker_inner(
         })
 
     return envelope
+
+
+async def __persist_worker_trace(db_factory, mission_id, thread_key, msgs, input_len, worker_id):
+    """把 worker 本次**新生成**的 thinking / tool-call / tool-result 落到 worker 线程。
+
+    meta 形状对齐 daemon 流式（daemon_sink.persist_stream_piece 的 'trace' 形状：
+    event_type + raw={type,toolCallId,toolName,input/output}），前端 missionTimeline 直接按
+    toolCallId 配对重建工具卡 → 点进 super↔worker 线程能看到 worker 的完整过程，而非只有最终回复。"""
+    if db_factory is None or not msgs:
+        return
+    from app.services.messaging_service import append_message
+    new_msgs = msgs[input_len:] if 0 <= input_len < len(msgs) else msgs
+    async with db_factory() as db:
+        for m in new_msgs:
+            mtype = getattr(m, "type", None) or getattr(m, "role", None)
+            if mtype in ("ai", "assistant"):
+                content = getattr(m, "content", "") or ""
+                if isinstance(content, str) and content.strip():
+                    await append_message(
+                        db, mission_id, thread_key, role="agent_log",
+                        content=content.strip()[:8000],
+                        meta={"type": "worker_step", "event_type": "thinking-segment", "worker_id": worker_id},
+                    )
+                for tc in (getattr(m, "tool_calls", None) or []):
+                    _n = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    _a = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
+                    _id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    await append_message(
+                        db, mission_id, thread_key, role="agent_log",
+                        content=f"🔧 {_n}",
+                        meta={"type": "worker_step", "event_type": "tool-input-available", "worker_id": worker_id,
+                              "raw": {"type": "tool-input-available", "toolCallId": str(_id or ""),
+                                      "toolName": _n, "input": _a}},
+                    )
+            elif mtype == "tool":
+                out = getattr(m, "content", "") or ""
+                _id = getattr(m, "tool_call_id", None)
+                await append_message(
+                    db, mission_id, thread_key, role="agent_log",
+                    content=str(out)[:4000],
+                    meta={"type": "worker_step", "event_type": "tool-output-available", "worker_id": worker_id,
+                          "raw": {"type": "tool-output-available", "toolCallId": str(_id or ""),
+                                  "output": str(out)[:8000]}},
+                )
 
 
 async def __load_thread_messages(db, mission_id, thread_key: str, exclude_latest: bool = False):
@@ -534,7 +626,8 @@ def invoke_worker_tool(ctx: BuiltinToolContext) -> StructuredTool:
             "（super-only）调度一个平台 worker。返回 JSON envelope。\n"
             "参数：\n"
             "- worker(str)：'capability:xhs_ops' 或具体 agent_id\n"
-            "- action(str)：worker capability_contract.advertises 里的 action 名\n"
+            "- action(str)：worker capability_contract.advertises 里的 action 名；"
+            "或万能兜底 'execute'（goal 写自然语言，worker 自选工具，含其绑定 MCP 的全部方法）\n"
             "- params(dict)：传给 worker 的参数（按 action.input_schema）\n"
             "- approval_ticket(str, optional)：requires_approval=true 的 action 需要先 request_approval 拿到 ticket\n"
             "envelope.status：completed / needs_clarification / failed / timeout / needs_approval"
@@ -599,15 +692,49 @@ def list_workers_tool(ctx: BuiltinToolContext) -> StructuredTool:
         if ctx.db_factory is None:
             return json.dumps({"ok": False, "error": "缺 db_factory"})
         async with ctx.db_factory() as db:
-            # 排除系统级 Builder 内部件（工厂流水线 / installer / tester / planner / assembler）：
-            # 它们是 kind='worker' 但属 Builder 自举，业务 super 不应在 list_workers 里看到/误派。
+            # 系统 worker（installer / approval_judge 等）可见性按调用方分级：
+            # - 业务 super：不可见（防误派系统件）；
+            # - 系统调用方（Builder / 系统 super，is_system=True）：可见——Builder 委派
+            #   mcp_installer 前会先 list_workers 验证，目录看不到会误判"installer 不存在"
+            #   而放弃委派转弹人工卡（v3 e2e 真出过）。
+            caller_is_system = False
+            if ctx.agent_id is not None:
+                caller = await db.get(Agent, ctx.agent_id)
+                caller_is_system = bool(caller is not None and caller.is_system)
             stmt = select(Agent).where(
-                Agent.kind == "worker", Agent.is_enabled.is_(True), Agent.is_system.is_(False)
+                Agent.kind == "worker", Agent.is_enabled.is_(True)
             )
+            if not caller_is_system:
+                stmt = stmt.where(Agent.is_system.is_(False))
             if capability:
                 stmt = stmt.where(Agent.capability == capability)
             stmt = stmt.order_by(Agent.capability, Agent.name).limit(limit).offset(offset)
             rows = (await db.execute(stmt)).scalars().all()
+        # MCP 能力清单（2026-07-05 xhs_publisher 双盲事故）：worker 绑定 MCP 的工具
+        # 让 super 派发时可见（否则 super 只看合同 actions，断言 worker「不会」它
+        # 运行时明明会的方法）。清单来自 mcp_inventory TTL 缓存，失败为空不阻塞。
+        _mcp_by_agent: dict = {}
+        if rows:
+            try:
+                from app.models.agent import AgentMCPServer as _AMS
+                from app.models.skill import MCPServer as _MCPS
+                from app.services import mcp_inventory as _inv
+                async with ctx.db_factory() as db2:
+                    _binds = (await db2.execute(
+                        select(_AMS.agent_id, _MCPS)
+                        .join(_MCPS, _MCPS.id == _AMS.mcp_server_id)
+                        .where(_AMS.agent_id.in_([a.id for a in rows]),
+                               _MCPS.is_enabled.is_(True))
+                    )).all()
+                for _aid, _srv in _binds:
+                    _tools = await _inv.get_tools_cached(_srv)
+                    if _tools:
+                        _mcp_by_agent.setdefault(_aid, {})[_srv.name] = [
+                            t["name"] for t in _tools
+                        ]
+            except Exception:  # noqa: BLE001
+                logger.warning("[list_workers] MCP 清单装配失败（跳过）", exc_info=True)
+
         items = []
         for a in rows:
             cap = (a.extra_config or {}).get("capability_contract") or {}
@@ -629,7 +756,7 @@ def list_workers_tool(ctx: BuiltinToolContext) -> StructuredTool:
                     if opt in x:
                         d[opt] = x[opt]
                 actions_detail.append(d)
-            items.append({
+            item = {
                 "agent_id": str(a.id),
                 "name": a.name,
                 "capability": a.capability,
@@ -637,8 +764,17 @@ def list_workers_tool(ctx: BuiltinToolContext) -> StructuredTool:
                 "advertises": [x.get("action") for x in (cap.get("advertises") or [])],
                 "actions": actions_detail,
                 "description": a.description,
-            })
-        return json.dumps({"ok": True, "page": page, "limit": limit, "items": items}, ensure_ascii=False)
+            }
+            if a.id in _mcp_by_agent:
+                item["mcp_tools"] = _mcp_by_agent[a.id]
+            items.append(item)
+        return json.dumps({
+            "ok": True, "page": page, "limit": limit, "items": items,
+            "note": (
+                "action 除 advertises 外始终可用万能兜底 'execute'（goal 自然语言，"
+                "worker 自选工具，含 mcp_tools 列的全部方法）"
+            ),
+        }, ensure_ascii=False)
     return StructuredTool.from_function(
         coroutine=_list,
         name="list_workers",

@@ -59,19 +59,22 @@ async def test_resume_after_clarification_handles_both_paused_for_human(
     assert proj.paused_reason is None
 
 
-async def test_pause_for_pending_cancels_current_tick(
+async def test_pause_for_pending_signals_current_tick(
     db_session, _patched_session_local, monkeypatch
 ):
+    """2026-07-03 语义更新：落卡只 **signal**（set cancel_event，E2 tool 边界收尾），
+    不再硬 cancel —— 本函数在 tick 的 tool 子 task 里执行，硬 cancel 自己会死锁 +
+    深 gather 链 RecursionError 僵尸（见 test_tick_cancel_deadlock.py）。"""
     mid = await _mk_running_mission(db_session)
 
-    cancelled: list[uuid.UUID] = []
+    signalled: list[uuid.UUID] = []
 
-    async def _fake_cancel(mission_id, **kw):
-        cancelled.append(mission_id)
-        return {"ok": True, "stage": "cooperative"}
+    def _fake_signal(mission_id):
+        signalled.append(mission_id)
+        return {"ok": True, "stage": "signal"}
 
     from app.services import super_inbox
-    monkeypatch.setattr(super_inbox, "cancel_current_tick", _fake_cancel)
+    monkeypatch.setattr(super_inbox, "signal_cancel", _fake_signal)
 
     from app.services import pending_approval_service as pas
     await pas._pause_for_pending(db_session, mid)
@@ -79,4 +82,4 @@ async def test_pause_for_pending_cancels_current_tick(
     db_session.expire_all()
     proj = await db_session.get(Mission, mid)
     assert proj.lifecycle_status == "paused_clarification"
-    assert cancelled == [mid], "落人工门时应硬停当前 tick (H1)"
+    assert signalled == [mid], "落人工门时应发协作取消信号 (H1 signal-only)"

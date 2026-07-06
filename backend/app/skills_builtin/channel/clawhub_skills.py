@@ -18,6 +18,38 @@ def _fmt_exc(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
+async def _resolve_target_project_id(
+    ctx: BuiltinToolContext, target_project_id: str
+) -> tuple[uuid.UUID | None, dict | None]:
+    """target_project_id → (mission UUID, None) 或 (None, 结构化错误)。
+
+    2026-07-03 e2e 实证：installer 的 LLM 传了 mission slug，`uuid.UUID(...)` 裸抛
+    ValueError 崩掉整个 invoke_worker 图。工具**永不裸抛**——坏参数回结构化错误让
+    LLM 自纠；slug 是 LLM 天然爱传的形态，顺手按 missions.slug 解析。"""
+    if not target_project_id:
+        return None, None
+    try:
+        return uuid.UUID(target_project_id), None
+    except ValueError:
+        pass
+    if ctx.db_factory is not None:
+        from sqlalchemy import select as _select
+
+        from app.models.mission import Mission as _Mission
+
+        async with ctx.db_factory() as db:
+            row = (await db.execute(
+                _select(_Mission.id).where(_Mission.slug == target_project_id)
+            )).scalar_one_or_none()
+        if row is not None:
+            return row, None
+    return None, {
+        "ok": False,
+        "error": f"target_project_id 既不是 UUID 也不是已知 mission slug: {target_project_id!r}",
+        "instruction": "传 mission 的 UUID 或有效 slug；不确定就留空（不绑定到具体 mission）。",
+    }
+
+
 # SKILL.md 中描述外部 setup / prerequisites / login / server 启动等步骤的 section 头
 # 容忍数字编号前缀（如 `## 1. Local Server Setup`）
 _SETUP_HEADING_PAT = re.compile(
@@ -219,7 +251,9 @@ def clawhub_install_tool(ctx: BuiltinToolContext) -> StructuredTool:
                     "仅 InstallerAgent 可在用户 request_approval 后绕开高危检查。"
                 ),
             }
-        pid = uuid.UUID(target_project_id) if target_project_id else None
+        pid, _pid_err = await _resolve_target_project_id(ctx, target_project_id)
+        if _pid_err is not None:
+            return _pid_err
         async with ctx.db_factory() as db:
             try:
                 rec = await remote_skill_installer.install(
@@ -297,7 +331,9 @@ def clawhub_list_installed_tool(ctx: BuiltinToolContext) -> StructuredTool:
 
         if ctx.db_factory is None:
             return {"ok": False, "error": "db_factory not available"}
-        pid = uuid.UUID(target_project_id) if target_project_id else None
+        pid, _pid_err = await _resolve_target_project_id(ctx, target_project_id)
+        if _pid_err is not None:
+            return _pid_err
         # A3：跨 project 边界保护
         # - 不传 target_project_id：返回全局（slug='builder' 项目允许；其他 project 只能列自己的）
         # - 传了 target_project_id：必须等于 ctx.mission_id，除非当前在 builder project

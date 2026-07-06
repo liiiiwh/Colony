@@ -68,8 +68,10 @@ async def test_created_super_records_origin_builder_mission(db_session, _patched
     assert agent.built_by_mission_id == mission_id
 
 
-async def test_created_worker_has_no_provenance(db_session, _patched_session_local):
-    # Only produced supers carry provenance; a worker created by Builder does not.
+async def test_created_worker_carries_provenance(db_session, _patched_session_local):
+    """2026-07-05 语义更新：worker 也带 built_by_mission_id——完整性 gate 的确定性
+    自修复按「本 builder 会话建的孤儿 worker」收编花名册（LLM 屡次无视 agent_update
+    声明指令，e2e 实证三连拒），provenance 让 finalize 能代劳。"""
     from app.skills_builtin.builder.builder_skills import agent_create_tool
 
     mission_id, mid = await _seed_builder_mission(db_session)
@@ -84,4 +86,4 @@ async def test_created_worker_has_no_provenance(db_session, _patched_session_loc
     agent = (await db_session.execute(
         select(Agent).where(Agent.id == uuid.UUID(res["agent_id"]))
     )).scalar_one()
-    assert agent.built_by_mission_id is None
+    assert agent.built_by_mission_id == mission_id

@@ -172,12 +172,6 @@ BUILTIN_SKILL_METADATA: list[dict] = [
         "description": "把当前分支所有交付物索引到指定知识库，用于跨项目经验沉淀",
         "builtin_ref": "archive_to_knowledge",
     },
-    {
-        "slug": "voice_chat_mock",
-        "name": "Voice Chat (Mock)",
-        "description": "【Mock】LLM 产品角色立即体验占位；未来替换为真 ASR/VAD/TTS 服务",
-        "builtin_ref": "voice_chat_mock",
-    },
     # ─── M4 Builder Agent 工具 ───
     {
         "slug": "skill_list_available",
@@ -441,33 +435,14 @@ BUILTIN_SKILL_METADATA: list[dict] = [
         "builtin_ref": "clawhub_list_installed",
         "category": "installer",
     },
-    {
-        "slug": "remote_skill_invoke",
-        "name": "Remote Skill Invoke (stub)",
-        "description": "（系统）调用 ClawHub 镜像 skill；M6 仍是 stub，M7+ 接入真执行",
-        "builtin_ref": "remote_skill_invoke",
-        "category": "installer",
-    },
+    # remote_skill_invoke 不再作为独立 skill 行播种：它只是 clawhub 安装件的
+    # builtin_ref 执行模板，工厂保留在 BUILTIN_TOOL_REGISTRY（安装件按 ref 查工厂）。
     # ─── M7 Tester 工具 ───
     {
         "slug": "mission_run_test",
         "name": "Mission Run Test",
         "description": "（Tester / Builder）对 project 跑一次 sandbox smoke test + LLM judge",
         "builtin_ref": "mission_run_test",
-        "category": "tester",
-    },
-    {
-        "slug": "sandbox_clone_mission",
-        "name": "Sandbox Clone Mission",
-        "description": "（Tester）把 project 复制为 sandbox- 项目（不启动；mission_run_test 内部已自动调用）",
-        "builtin_ref": "sandbox_clone_mission",
-        "category": "tester",
-    },
-    {
-        "slug": "sandbox_cleanup",
-        "name": "Sandbox Cleanup",
-        "description": "（Tester）按 sandbox mission_id 删除（仅 slug 以 sandbox- 开头者）",
-        "builtin_ref": "sandbox_cleanup",
         "category": "tester",
     },
     # ── L1 输出质量门 ──────────────────────────────────────────────────
@@ -605,25 +580,12 @@ BUILTIN_SKILL_METADATA: list[dict] = [
     {"slug": "validate_backward_compat", "name": "Validate Backward Compat",
      "description": "（Builder-only v3）R9 升级 worker 前 dry-run capability_contract 兼容校验。",
      "builtin_ref": "validate_backward_compat", "category": "builder"},
-    # v6 · 一次性 spec-based 创建（替代老的 6 步 LLM 编排）
-    {"slug": "build_super", "name": "Build Super (spec)",
-     "description": "（Builder-only v6）一次 tool 调用从 spec_json 创建 SuperAgent + Mission + 必需 skill + optional schedule。替代 6 步编排。",
-     "builtin_ref": "build_super", "category": "builder"},
-    {"slug": "build_worker", "name": "Build Worker (spec)",
-     "description": "（Builder-only v6）一次 tool 调用从 spec_json 创建/升级 WorkerAgent（平台共享，按 capability upsert）。",
-     "builtin_ref": "build_worker", "category": "builder"},
     {"slug": "release_work_claim", "name": "Release Work Claim",
      "description": "（Builder-only ADR-009）处理完某 worker/super/skill 后释放本 session 的处理锁，让其它 session 接手。",
      "builtin_ref": "release_work_claim", "category": "builder"},
     {"slug": "create_skill_from_template", "name": "Create Skill From Template",
      "description": "（Builder-only ADR-009）从白名单模板（http_api_call/mcp_proxy/prompt_macro）创建新 skill，不跑任意代码；补 build_* 缺失 skill。",
      "builtin_ref": "create_skill_from_template", "category": "builder"},
-    {"slug": "find_workers", "name": "Find Workers (semantic)",
-     "description": "（Builder-only v6）按 action/side_effects/requires_approval/parallel_safe 复合维度查 worker catalog；比 list_workers 强。",
-     "builtin_ref": "find_workers", "category": "builder"},
-    {"slug": "worker_telemetry", "name": "Worker Telemetry",
-     "description": "（Builder-only v6）拉 worker 健康度（success_rate/p95/top_errors/tokens）。Builder 改 worker 协议 / 决定 upgrade-vs-new 时必调。",
-     "builtin_ref": "worker_telemetry", "category": "builder"},
     {"slug": "promote_to_platform", "name": "Promote to Platform KB",
      "description": "v6 · 把一条经验/规则推到平台共享 KB，所有 super 都能 search。super/Builder 都可调。",
      "builtin_ref": "promote_to_platform", "category": "utility"},

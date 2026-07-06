@@ -90,11 +90,6 @@ async def _resolve_agent_model(db: AsyncSession, agent: Agent) -> LLMModel:
     return model
 
 
-#: 新建 Agent 时自动绑定的内置 Skill。
-#: 排除名单里的技能默认不会自动绑定——它们属于"Supervisor 专用"，Worker 不应拥有：
-#: - rollback_to_node / dispatch_to_worker / parallel_dispatch / request_approval /
-#:   request_structured_input / archive_to_knowledge / set_branch_description
-#: voice_chat_mock 也默认排除：仅"立即体验"角色 Agent 需要。
 # v6.M (R2-4) · DEFAULT_AUTO_BIND_SKILL_EXCLUDE 已删（migration 049 后 Skill.scope 是真相源）
 # auto-bind 只看 Skill.scope IN (agent_kind, 'all')；新 super-only skill 注册时填 scope='super' 即可。
 # 历史：v3-v5 在这里 hardcode 黑名单防 worker 误绑 super tool；v6 改 declarative scope。
@@ -177,6 +172,25 @@ async def create_agent(
         data["thinking_level"] = "off"
     # V42 worker.protocol_md forbidden-word check
     await _v42_check_worker_protocol(db, kind, data.get("protocol_md"))
+    # ── worker 最小 capability_contract 兜底（确定性，不靠 LLM 自觉）──
+    # 无 contract 的 worker super 无法调度（list_workers advertises 空）；真出过 Builder
+    # BUILD 建 4 个 worker 全漏写 → super 首跑即 escalation。缺省合成单 'execute' action，
+    # LLM 需要精确 actions/审批语义时再 agent_update(capability_contract=...) 覆盖。
+    if kind == "worker" and data.get("capability"):
+        _extra = dict(data.get("extra_config") or {})
+        if not _extra.get("capability_contract"):
+            _extra["capability_contract"] = {
+                "capability": data["capability"],
+                "version": "0.1.0",
+                "advertises": [{
+                    "action": "execute",
+                    "input_schema": {"goal": "string", "params": "object?"},
+                    "output_schema": {"result": "object"},
+                    "side_effects": [],
+                    "requires_approval": False,
+                }],
+            }
+            data["extra_config"] = _extra
     agent = Agent(**data)
     db.add(agent)
     await db.flush()  # 拿到 agent.id，用于 AgentSkill 外键
@@ -386,6 +400,28 @@ async def assemble_system_prompt_async(
     from app.services import memory_service
 
     parts = _collect_static_prompt_parts(agent)
+
+    # ── 已绑定 MCP 能力清单（2026-07-05 xhs_publisher 双盲事故）──
+    # MCP 工具虽然全量注入工具位，但提示词里没有清单+说明 → worker 声称/被认为
+    # 「不具备」绑定 MCP 的能力。read-time 从 mcp_inventory（TTL 缓存）取，永不抛。
+    try:
+        from sqlalchemy import inspect as _sa_inspect
+        if "mcp_servers" not in _sa_inspect(agent).unloaded and (agent.mcp_servers or []):
+            from app.services import mcp_inventory as _mcp_inv
+            _inv = await _mcp_inv.tools_for_agent(agent)
+            if _inv:
+                _lines = ["## 已绑定 MCP 能力（这些工具就在你的工具列表里，直接函数调用）"]
+                for _srv, _tools in _inv.items():
+                    _lines.append(f"### {_srv}")
+                    _lines.extend(
+                        f"- `{t['name']}`：{t.get('description') or ''}" for t in _tools
+                    )
+                _lines.append(
+                    "以上是你的实际运行时能力——不要声称不具备；调用失败时把错误原文回报并重试合理参数。"
+                )
+                parts.append("\n".join(_lines))
+    except Exception:  # noqa: BLE001
+        logger.warning("[prompt] MCP 能力清单注入失败（跳过）agent=%s", agent.name, exc_info=True)
 
     # M3 + 2026-05-19：双轨记忆注入
     # - memory_scope='project'（daemon 模式）：只读 MissionAgentMemory

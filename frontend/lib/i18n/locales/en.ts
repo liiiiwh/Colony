@@ -478,6 +478,7 @@ export const en = {
     systemMsg: 'System',
     sysMsgKind: { dispatch: 'dispatch', health: 'health-check', issue: 'degrade-signal', escalation: 'escalation', approval: 'approval-reply', system: 'auto' },
     ticking: 'ticking',
+    assistantThinking: 'AI is working…',
     pendingMessages: '{{count}} pending messages',
     runOnce: 'Run Once',
     start: 'Start',

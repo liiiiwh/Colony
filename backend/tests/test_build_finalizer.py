@@ -20,8 +20,11 @@ async def test_finalize_creates_default_schedule_and_origin(db_session):
     user = User(username="u", email="u@x.com", hashed_password="x", role="admin")
     db_session.add(user)
     sup = Agent(name="Srv Mon Super", kind="super", category="custom",
-                slug="srv-mon", display_name="服务器运维监控")
+                slug="srv-mon", display_name="服务器运维监控",
+                extra_config={"required_capabilities": ["srv_monitor"]})
     db_session.add(sup)
+    # 完整构建：声明的能力有对应 worker（否则 2026-07-06 空 roster gate 会挡下激活）
+    db_session.add(Agent(name="w-srv", kind="worker", category="custom", capability="srv_monitor"))
     await db_session.flush()
     built = Mission(name="服务器运维监控", slug="srv-mon", supervisor_agent_id=sup.id,
                     created_by=user.id, workflow_config={})
@@ -67,8 +70,11 @@ async def test_finalize_runs_for_plus_new_builder_mission(db_session):
     builder_sup = Agent(name="Builder Supervisor", kind="super", category="builder",
                         slug="builder", display_name="Colony Builder")
     new_super = Agent(name="Legal Reviewer", kind="super", category="custom",
-                      slug="contract-review", display_name="合同条款审查助理")
+                      slug="contract-review", display_name="合同条款审查助理",
+                      extra_config={"required_capabilities": ["contract_review"]})
     db_session.add_all([builder_sup, new_super])
+    # 完整构建：声明的能力有对应 worker（2026-07-06 空 roster gate）
+    db_session.add(Agent(name="w-cr", kind="worker", category="custom", capability="contract_review"))
     await db_session.flush()
     # +新建 builder mission（slug 非 'builder'，但 supervisor 是 builder super）
     plus_new = Mission(name="合同条款审查", slug="mission-abc", supervisor_agent_id=builder_sup.id,

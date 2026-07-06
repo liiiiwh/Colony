@@ -71,6 +71,21 @@ class TransientRefreshError extends Error {
   }
 }
 
+/**
+ * 主动刷新 access token（供 SSE 等不经 axios 拦截器的裸连接用）。
+ * EventSource 把 token 烧进 URL，过期后原生重连仍带旧 token → 永久 401；
+ * 调用方在 onerror 里调本函数刷新 store，token 变化触发组件重连（带新 token）。
+ * 复用同一 in-flight refreshPromise，避免并发重复刷新。
+ */
+export async function refreshAuthToken(): Promise<string> {
+  refreshPromise ??= refreshAccessToken();
+  try {
+    return await refreshPromise;
+  } finally {
+    refreshPromise = null;
+  }
+}
+
 async function refreshAccessToken(): Promise<string> {
   const rt = getRefreshToken();
   if (!rt) throw new Error('no refresh token');

@@ -32,6 +32,9 @@ services:
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
       S3_FORCE_PATH_STYLE: "true"
+      # 浏览器自动化类 MCP（go-rod）用系统 Chromium；Dockerfile 已装 + 设此 ENV，
+      # 这里再显式声明一份，确保重建/重创容器时子进程（_spawn_and_wait 拉起的 MCP）继承。
+      ROD_BROWSER_BIN: /usr/bin/chromium
     ports:
       - "9022:9022"
     depends_on:

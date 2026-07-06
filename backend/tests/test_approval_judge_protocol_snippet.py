@@ -34,3 +34,18 @@ def test_mission_create_default_protocol_includes_snippet():
     assert "APPROVAL_JUDGE_PROTOCOL_SNIPPET" in src, (
         "mission_create 默认 protocol 必须 include APPROVAL_JUDGE_PROTOCOL_SNIPPET"
     )
+
+
+def test_judge_policy_read_display_ops_never_gate():
+    """2026-07-05 用户决议：读/展示类操作（取登录二维码、查登录状态、拉数据）不出审批卡——
+    直接执行并把结果渲染进会话，扫码本身就是用户动作，无需先「批准展示」。
+    旧规则把 'scan a QR' 列为硬停点 → 每次取码弹一张卡（e2e 实证连弹 3 张）。"""
+    from app.db.system_agent_prompts import _APPROVAL_JUDGE_PROTOCOL as p
+
+    assert "Read / display operations" in p or "read/display" in p.lower(), \
+        "协议必须有读/展示类免卡规则"
+    assert "must_human=false" in p
+    # 取码/查状态被明确点名为免卡
+    assert "QR" in p and ("render" in p or "display" in p.lower())
+    # 硬停点 1 不再把「展示二维码给用户扫」当成必须人工
+    assert "merely displaying" in p.lower() or "NOT this" in p

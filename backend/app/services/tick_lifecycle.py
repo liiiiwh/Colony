@@ -40,8 +40,24 @@ def register_task(mission_id: uuid.UUID, task: asyncio.Task) -> None:
         ev.clear()
 
 
-def unregister_task(mission_id: uuid.UUID) -> None:
+def unregister_task(mission_id: uuid.UUID, task: asyncio.Task | None = None) -> None:
+    """注销注册。传 task 时只在「注册的确实是它」才 pop——防 skip/respawn task 的
+    finally 弹掉真 tick 的注册（2026-07-03 事故帮凶之一）。"""
+    if task is not None and _RUNNING_TICKS.get(mission_id) is not task:
+        return
     _RUNNING_TICKS.pop(mission_id, None)
+
+
+def signal_cancel(mission_id: uuid.UUID) -> dict:
+    """只 set 协作取消信号，不 await/不 cancel task —— **tick 内部人工门专用**。
+
+    2026-07-03 事故：LangGraph 把 tool 跑在子 task 里，cancel_current_tick 的
+    `task is current_task()` 自检失效 → tool wait_for(shield(tick)) 等 tick、tick 等
+    tool 返回 = 死锁；10s 超时强 cancel 又沿 ~千层嵌套 gather 递归爆 RecursionError →
+    tick 僵尸永久持锁。tick 内只能发信号，让 E2 checkpoint（on_tool_end）break 收尾。"""
+    _CANCEL_HISTORY[mission_id].append(time.time())
+    get_cancel_event(mission_id).set()
+    return {"ok": True, "stage": "signal"}
 
 
 def is_running(mission_id: uuid.UUID) -> bool:
@@ -70,7 +86,17 @@ async def cancel_current_tick(
         await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
         return {"ok": True, "stage": "cooperative", "task_done": True}
     except TimeoutError:
-        task.cancel()
+        # ⚠️ LangGraph astream_events 内部是 ~千层嵌套 gather；task.cancel() 会沿链
+        # 递归（_GatheringFuture.cancel → child.cancel → …）爆 RecursionError（2026-07-03
+        # 真实事故）。兜住：结构化返回，锁交给 run_once 的 TTL 自愈。
+        try:
+            task.cancel()
+        except RecursionError:
+            logger.warning(
+                "[tick_lifecycle] force cancel 撞深 gather 链 RecursionError mission=%s "
+                "→ 放弃硬 cancel（tick 锁由 TTL 自愈回收）", mission_id,
+            )
+            return {"ok": False, "stage": "forced_failed_recursion", "task_done": task.done()}
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except (TimeoutError, asyncio.CancelledError):

@@ -18,7 +18,14 @@ RUN apt-get update \
         ca-certificates \
         curl \
         gnupg \
+        chromium \
     && rm -rf /var/lib/apt/lists/*
+
+# 基础依赖 · headless Chromium：浏览器自动化类 MCP（如 xiaohongshu-mcp 的 go-rod）
+# 需要一个本机浏览器来渲染登录二维码 / 页面。go-rod 的 LookPath 在本镜像匹配不到
+# /usr/bin/chromium，故用 ROD_BROWSER_BIN 显式指路（xiaohongshu-mcp main.go 读它）；
+# ENV 全局设置 → 平台 _spawn_and_wait 重启 MCP 时子进程自动继承，无需逐个 startup_command 塞。
+ENV ROD_BROWSER_BIN=/usr/bin/chromium
 
 # go 工具链（官方 tar，apt 的 golang 通常过旧；版本可按需升级）
 ENV GO_VERSION=1.22.5

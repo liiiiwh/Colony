@@ -296,26 +296,84 @@ async def delete_mission_with_optional_cascade_agents(
     }
 
 
+def _capability_haystack(agent) -> str:
+    """super 引用 worker 的全部文本面：protocol_md + extra_config（花名册可能只在
+    extra_config.required_capabilities，protocol 里不含 slug——真出过 4 个 worker 全漏扫）。"""
+    import json
+
+    parts = [getattr(agent, "protocol_md", None) or ""]
+    extra = getattr(agent, "extra_config", None)
+    if extra:
+        try:
+            parts.append(json.dumps(extra, ensure_ascii=False))
+        except (TypeError, ValueError):
+            pass
+    return "\n".join(parts)
+
+
+def _references_capability(haystack: str, capability: str) -> bool:
+    """引用面里是否出现某 capability（词边界，防 'xhs' 误配 'xhs_writer'）。"""
+    import re
+
+    if not haystack or not capability:
+        return False
+    return re.search(rf"\b{re.escape(capability)}\b", haystack) is not None
+
+
+async def _scan_super_workers(db: AsyncSession, super_agent) -> tuple[list, list[dict]]:
+    """找出 super 的成员 worker，分成 (独占可删, 保留[{name,reason}])。
+
+    成员关系的活链接 = super 的 protocol_md / extra_config 里的 capability 引用
+    （invoke_worker 的派发依据 + required_capabilities 花名册）。
+    不用 built_by_mission_id：它对 worker 恒 NULL，且 builder mission 被删后 SET NULL 断链。
+    独占 = 非 is_system 且没有其他 super 引用同一 capability。
+    """
+    from app.models.agent import Agent
+
+    haystack = _capability_haystack(super_agent)
+    workers = (await db.execute(
+        select(Agent).where(Agent.kind == "worker", Agent.capability.is_not(None))
+    )).scalars().all()
+    members = [w for w in workers if _references_capability(haystack, w.capability)]
+    if not members:
+        return [], []
+
+    other_supers = (await db.execute(
+        select(Agent).where(Agent.kind == "super", Agent.id != super_agent.id)
+    )).scalars().all()
+    other_haystacks = [_capability_haystack(s) for s in other_supers]
+
+    to_delete, to_keep = [], []
+    for w in members:
+        if w.is_system:
+            to_keep.append({"name": w.name, "reason": "system"})
+        elif any(_references_capability(h, w.capability) for h in other_haystacks):
+            to_keep.append({"name": w.name, "reason": "shared"})
+        else:
+            to_delete.append(w)
+    return to_delete, to_keep
+
+
 async def preview_super_cascade(db: AsyncSession, super_agent) -> dict:
-    """预览级联删 super 的影响（不删任何东西，ADR-027）。
+    """预览级联删 super 的影响（不删任何东西）。
 
     返回 {super_name, mission_count, missions[], workers_to_delete[], workers_to_keep[{name,reason}]}。
 
-    ADR-027 节点版退役：worker 是平台级共享资源（按 capability 全局发现，不再按 mission
-    预绑），删 super 不再连带删 worker——`workers_to_delete` 恒为空。仅删 super 名下 Mission +
-    super 本体（除非 is_system）。
+    worker 归属按 protocol 的 capability 引用判定（见 _scan_super_workers）——
+    ADR-027 曾把 workers_to_delete 一刀切恒空，导致删 super 留下整队孤儿 worker。
     """
     super_id = super_agent.id
     missions = (await db.execute(
         select(Mission).where(Mission.supervisor_agent_id == super_id)
     )).scalars().all()
+    to_delete, to_keep = await _scan_super_workers(db, super_agent)
 
     return {
         "super_name": super_agent.display_name or super_agent.name,
         "mission_count": len(missions),
         "missions": [m.name for m in missions],
-        "workers_to_delete": [],
-        "workers_to_keep": [],
+        "workers_to_delete": [w.name for w in to_delete],
+        "workers_to_keep": to_keep,
     }
 
 
@@ -327,7 +385,8 @@ async def delete_super_with_cascade(db: AsyncSession, super_agent) -> dict:
     级联策略（复用 delete_mission_with_optional_cascade_agents 的安全语义）：
     - 逐个删 super 名下的 Mission（cascade_agents=True）：每个 Mission 的 schedule /
       pending_approvals / mission_agent_memory 由 DB FK ondelete=CASCADE 自动清。
-      ADR-027：worker 是平台级共享资源，不再级联删。
+    - 删该 super 独占的 worker（protocol 引用其 capability 且无其他 super 引用，
+      见 _scan_super_workers；is_system / shared 保留并记入 skipped）。
     - 删到最后一个 Mission 时 super 已无引用 → 由同一级联逻辑顺带删掉（除非 is_system）。
     - 兜底：若 super 仍残留（如 0 Mission 直接级联删），且非 is_system，显式删之
       （agent_skills / agent_mcp_servers / agent_aux_models / protocol 历史均 FK CASCADE）。
@@ -339,6 +398,8 @@ async def delete_super_with_cascade(db: AsyncSession, super_agent) -> dict:
 
     super_name = super_agent.display_name or super_agent.name
     super_id = super_agent.id
+    # 先扫描 worker 归属（依赖 super.protocol_md，须在 super 被级联删掉之前算）
+    workers_to_delete, workers_kept = await _scan_super_workers(db, super_agent)
 
     missions = (await db.execute(
         select(Mission).where(Mission.supervisor_agent_id == super_id)
@@ -352,6 +413,16 @@ async def delete_super_with_cascade(db: AsyncSession, super_agent) -> dict:
         deleted_missions.append(res["deleted_project"])
         deleted_agents.extend(res["deleted_agents"])
         skipped.extend(res["skipped_shared_or_failed"])
+
+    # 删独占 worker（扫描结果在 super 删除前已定格）
+    for w in workers_to_delete:
+        try:
+            await db.delete(w)
+            await db.commit()
+            deleted_agents.append(f"{w.name}(id={w.id})")
+        except Exception as exc:  # noqa: BLE001
+            skipped.append(f"{w.name}(id={w.id}, 删除失败: {exc})")
+    skipped.extend(f"{k['name']}[{k['reason']}]" for k in workers_kept)
 
     # 兜底删 super 本体（级联可能已删；0 mission 时必走这里）
     still = await db.get(Agent, super_id)

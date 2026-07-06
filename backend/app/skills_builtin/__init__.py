@@ -10,7 +10,7 @@
 - s3_upload / s3_download / s3_list
 - knowledge_search / knowledge_index / list_knowledge_bases / archive_to_knowledge
 - set_branch_description / record_decision / rollback_to_node / request_approval
-- request_structured_input / voice_chat_mock
+- request_structured_input
 - invoke_aux_model / fetch_url
 """
 
@@ -60,11 +60,7 @@ from app.skills_builtin.channel.clawhub_skills import (
     remote_skill_invoke_tool,
 )
 from app.skills_builtin.context import BuiltinToolContext
-from app.skills_builtin.builder.tester_skills import (
-    mission_run_test_tool,
-    sandbox_cleanup_tool,
-    sandbox_clone_project_tool,
-)
+from app.skills_builtin.builder.tester_skills import mission_run_test_tool
 from app.skills_builtin.channel.fetch_skills import fetch_url_tool
 from app.skills_builtin.knowledge.experience_skills import experience_record_tool
 from app.skills_builtin.knowledge.knowledge_skills import (
@@ -114,13 +110,9 @@ from app.skills_builtin.builder.builder_lifecycle_skills import (
     validate_backward_compat_tool,
 )
 from app.skills_builtin.builder.builder_factory_skills import (
-    build_super_tool,
-    build_worker_tool,
     create_skill_from_template_tool,
     release_work_claim_tool,
 )
-from app.skills_builtin.builder.builder_find_skills import find_workers_tool
-from app.skills_builtin.builder.builder_telemetry_skills import worker_telemetry_tool
 from app.skills_builtin.knowledge.knowledge_promote_skills import (
     platform_knowledge_search_tool,
     promote_to_platform_tool,
@@ -131,7 +123,6 @@ from app.skills_builtin.super.supervisor_skills import (
     record_decision_tool,
     request_approval_tool,
     request_structured_input_tool,
-    voice_chat_mock_tool,
 )
 from app.skills_builtin.worker_io.workspace_skills import (
     workspace_list_tool,
@@ -163,7 +154,6 @@ BUILTIN_TOOL_REGISTRY.update(
         "request_approval": request_approval_tool,
         "request_structured_input": request_structured_input_tool,
         "archive_to_knowledge": archive_to_knowledge_tool,
-        "voice_chat_mock": voice_chat_mock_tool,
         "invoke_aux_model": invoke_aux_model_tool,
         "parallel_invoke_aux_model": parallel_invoke_aux_model_tool,
         "merge_videos": merge_videos_tool,
@@ -204,8 +194,6 @@ BUILTIN_TOOL_REGISTRY.update(
         "remote_skill_invoke": remote_skill_invoke_tool,
         # M7 Tester
         "mission_run_test": mission_run_test_tool,
-        "sandbox_clone_mission": sandbox_clone_project_tool,
-        "sandbox_cleanup": sandbox_cleanup_tool,
         # L1 输出质量门（Factory 自动给副作用节点前插 quality_gate worker）
         "output_quality_check": output_quality_check_tool,
         "output_quality_check_force_override": output_quality_check_force_override_tool,
@@ -235,17 +223,10 @@ BUILTIN_TOOL_REGISTRY.update(
         # v3 Builder-only
         "resume_super_agent": resume_super_agent_tool,
         "validate_backward_compat": validate_backward_compat_tool,
-        # v6 Builder-only · 一次性创建 super/worker（替代 5-6 步链）
-        "build_super": build_super_tool,
-        "build_worker": build_worker_tool,
         # ADR-009 G4 · Builder 多 session 互斥锁释放
         "release_work_claim": release_work_claim_tool,
         # ADR-009 G6 · Builder 受限模板化 skill 创建
         "create_skill_from_template": create_skill_from_template_tool,
-        # v6 Builder-only · capability 索引复合查询
-        "find_workers": find_workers_tool,
-        # v6 Builder-only · worker 健康度遥测
-        "worker_telemetry": worker_telemetry_tool,
         # v6 · 平台共享经验 KB (super/Builder 都可调)
         "promote_to_platform": promote_to_platform_tool,
         "platform_knowledge_search": platform_knowledge_search_tool,
