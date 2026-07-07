@@ -74,7 +74,8 @@ def test_list_without_images_passthrough():
 
 
 @pytest.mark.asyncio
-async def test_wrapped_coroutine_sanitizes_success_result():
+async def test_wrapped_coroutine_no_ctx_falls_back_to_inline():
+    """无 ctx（拿不到会话）→ 退回内联 markdown，至少不崩、不丢图。"""
     async def _orig(**kw):
         return [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,{B64}"}}]
 
@@ -82,3 +83,87 @@ async def test_wrapped_coroutine_sanitizes_success_result():
                                   server_name="xhs-mcp", ctx=None)
     out = await wrapped()
     assert isinstance(out, str) and f"data:image/png;base64,{B64}" in out
+
+
+class _FakeCtx:
+    """带 db_factory + mission_id 的最小 ctx，用于验证图片旁路发会话。"""
+    def __init__(self, mission_id, published):
+        import uuid as _u
+        self.mission_id = mission_id if isinstance(mission_id, _u.UUID) else _u.UUID(str(mission_id))
+        self.thread_key = "worker-sub"
+        self._published = published
+
+        class _DB:
+            async def __aenter__(_s): return _s
+            async def __aexit__(_s, *a): return False
+        self._db = _DB()
+
+    def db_factory(self):
+        return self._db
+
+
+@pytest.mark.asyncio
+async def test_content_and_artifact_tool_keeps_tuple_shape(monkeypatch):
+    """回归（2026-07-06 实证）：langchain-mcp-adapters 用 response_format='content_and_artifact'，
+    工具必须返回 2-元组 (content, artifact)。图片旁路后若返回纯字符串占位符 → LangChain 报
+    'Since response_format=content_and_artifact a two-tuple is expected' → worker 调用直接失败。
+    修：原始是元组时，占位符也要保元组形状 (placeholder, None)。"""
+    import uuid
+
+    from app.services import messaging_service
+
+    async def _noop_append(db, mission_id, thread_key, role, content, **kw):
+        pass
+    monkeypatch.setattr(messaging_service, "append_message", _noop_append)
+
+    async def _orig(**kw):
+        # adapter 形状：(content_blocks, artifact)
+        return ([{"type": "image", "base64": B64, "mime_type": "image/png"}], {"structured": 1})
+
+    ctx = _FakeCtx(uuid.uuid4(), [])
+    wrapped = wrap_tool_coroutine(_orig, tool_name="get_login_qrcode",
+                                  server_name="xiaohongshu-mcp", ctx=ctx)
+    out = await wrapped()
+    assert isinstance(out, tuple) and len(out) == 2, "content_and_artifact 工具必须回 2-元组"
+    assert isinstance(out[0], str) and B64 not in out[0], "content 侧是不含 base64 的占位符"
+
+
+@pytest.mark.asyncio
+async def test_image_published_as_artifact_placeholder_to_llm(monkeypatch):
+    """2026-07-06 用户实证：get_login_qrcode 的 5000+ 字符 base64 被 worker/super LLM
+    逐 token 吐出来（浪费 token + 可能被改坏 + 不瞬时）。修：MCP 工具返回图片 → **旁路
+    直接发到 super 主会话渲染**，只给 LLM 一个**不含 base64** 的短占位符。"""
+    import uuid
+
+    from app.services import messaging_service
+
+    calls = []
+
+    async def _fake_append(db, mission_id, thread_key, role, content, **kw):
+        calls.append({"mission_id": mission_id, "thread_key": thread_key, "content": content,
+                      "meta": kw.get("meta")})
+
+    monkeypatch.setattr(messaging_service, "append_message", _fake_append)
+
+    async def _orig(**kw):
+        return [
+            {"type": "text", "text": "扫码登录"},
+            {"type": "image", "base64": B64, "mime_type": "image/png"},
+        ]
+
+    mid = uuid.uuid4()
+    ctx = _FakeCtx(mid, calls)
+    wrapped = wrap_tool_coroutine(_orig, tool_name="get_login_qrcode",
+                                  server_name="xiaohongshu-mcp", ctx=ctx)
+    out = await wrapped()
+
+    # 给 LLM 的返回：短占位符，绝不含 base64
+    assert isinstance(out, str)
+    assert B64 not in out, "base64 绝不能进 LLM 上下文（会被逐 token 吐 + 改坏 + 烧 token）"
+    assert "二维码" in out or "图片" in out or "image" in out.lower()
+
+    # 图片旁路直接发到会话（含 data:image，前端渲染）
+    assert len(calls) == 1, "应有且仅有一条图片 artifact 消息发到会话"
+    assert f"data:image/png;base64,{B64}" in calls[0]["content"]
+    assert calls[0]["thread_key"] == "main", "发到 super 主会话（用户看的地方），不是 worker 子线程"
+    assert str(mid) == str(calls[0]["mission_id"])

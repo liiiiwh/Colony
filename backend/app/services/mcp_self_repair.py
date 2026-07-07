@@ -83,6 +83,75 @@ def sanitize_mcp_result(res):
     return "\n\n".join(p for p in parts if p)
 
 
+def _split_images(res):
+    """从 MCP 结果里分出图片。返回 (image_markdowns: list[str], text_only: str|None)。
+    非 list / 无图片 → ([], None)。tuple(content_and_artifact) 从 content 侧抽。"""
+    if isinstance(res, tuple) and len(res) == 2:
+        return _split_images(res[0])
+    if not isinstance(res, list):
+        return [], None
+    imgs: list[str] = []
+    texts: list[str] = []
+    for b in res:
+        if isinstance(b, dict) and b.get("type") in ("image", "image_url"):
+            md = _image_block_to_markdown(b)
+            if md:
+                imgs.append(md)
+                continue
+        if isinstance(b, dict) and b.get("type") == "text":
+            texts.append(str(b.get("text") or ""))
+            continue
+        texts.append(b if isinstance(b, str) else str(b))
+    if not imgs:
+        return [], None
+    return imgs, "\n\n".join(t for t in texts if t)
+
+
+async def _publish_images_as_artifacts(ctx: Any, images: list[str], tool_name: str) -> bool:
+    """把图片 markdown **旁路直接发到 super 主会话**（mission_id, 'main'）渲染——不经任何
+    LLM。2026-07-06 用户实证：get_login_qrcode 的 5000+ 字符 base64 被 worker→super LLM
+    逐 token 吐出来（烧 token + 可能被改坏 + 不瞬时）。图片应像 artifact 一样旁路展示，
+    LLM 只拿短占位符。返回是否发成功（失败/无 ctx → 调用方回退内联，至少不丢图）。"""
+    mid = getattr(ctx, "mission_id", None)
+    if ctx is None or getattr(ctx, "db_factory", None) is None or mid is None:
+        return False
+    try:
+        from app.services import messaging_service
+        body = "\n\n".join(images)
+        async with ctx.db_factory() as db:
+            await messaging_service.append_message(
+                db, mid, "main", role="agent_log", content=body,
+                meta={"kind": "mcp_image_artifact", "tool": tool_name, "count": len(images)},
+            )
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("[mcp_self_repair] 旁路发图 artifact 失败 tool=%s", tool_name)
+        return False
+
+
+async def _handle_result(raw, *, tool_name: str, ctx: Any):
+    """MCP 成功结果的统一处理：有图片 → 旁路发会话 + 回**不含 base64** 的短占位符给 LLM；
+    无图片 → 原样（sanitize 兜底非多模态）。
+
+    ⚠️ 保留元组形状：langchain-mcp-adapters 用 response_format='content_and_artifact'，
+    原始返回是 (content, artifact) 2-元组时，占位符也**必须**回 (placeholder, None)，
+    否则 LangChain 报 'a two-tuple is expected' → worker 调用直接失败（2026-07-06 回归）。"""
+    is_tuple = isinstance(raw, tuple) and len(raw) == 2
+    images, text_only = _split_images(raw)
+    if not images:
+        return sanitize_mcp_result(raw)
+    if await _publish_images_as_artifacts(ctx, images, tool_name):
+        note = (
+            f"✅ `{tool_name}` 返回了 {len(images)} 张图片，已**直接展示在会话中**"
+            f"（如登录二维码，用户可直接查看/扫码）。⚠️ 图片数据不进上下文、也**不要你复述或"
+            f"输出任何 base64/图片数据**——只需用一句话提示用户查看即可。"
+        )
+        placeholder = f"{text_only}\n\n{note}".strip() if text_only else note
+        return (placeholder, None) if is_tuple else placeholder
+    # 拿不到会话（无 ctx）→ 回退内联 markdown：至少不丢图、不崩（前端仍能渲染）。
+    return sanitize_mcp_result(raw)
+
+
 async def _report_to_worker_opt(server_name: str, err: Exception, ctx: Any) -> None:
     """Tier 2 — best-effort lightweight signal to the worker-opt mission. Never raises."""
     try:
@@ -117,7 +186,8 @@ def wrap_tool_coroutine(
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                return sanitize_mcp_result(await orig_coro(*args, **kwargs))
+                raw = await orig_coro(*args, **kwargs)
+                return await _handle_result(raw, tool_name=tool_name, ctx=ctx)
             except Exception as e:  # noqa: BLE001 — any MCP transport/tool error
                 last_exc = e
                 logger.warning(
