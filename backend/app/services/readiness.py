@@ -118,29 +118,54 @@ async def _post_and_pause(db, mission_id, server: MCPServer, requirement: dict) 
         if qr_err:
             requirement = {**requirement, "fetch_error": qr_err}
             logger.warning("[readiness] QR 拉取失败 server=%s：%s", server.name, qr_err)
-    card = build_human_action_card(requirement, server_name=server.name, qr_image_url=qr_url)
-    # 幂等：同项目已有同标题的 pending 卡 → 不重复发（re-finalize / re-probe 不刷屏）
-    try:
-        from sqlalchemy import text as _text
-        _pid = mission_id if isinstance(mission_id, uuid.UUID) else uuid.UUID(str(mission_id))
-        dup = (await db.execute(_text(
-            "SELECT 1 FROM pending_approvals WHERE mission_id=:p AND title=:t AND status='pending' LIMIT 1"
-        ), {"p": str(_pid), "t": card["title"]})).first()
-        if dup:
-            logger.info("[readiness] 同标题 pending 卡已存在，跳过重复发：%s", card["title"])
-            return
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from app.services import pending_approval_service as pa
-
-        await pa.create_pending(
-            db,
-            mission_id=mission_id if isinstance(mission_id, uuid.UUID) else uuid.UUID(str(mission_id)),
-            title=card["title"], message=card["body"], options=card["options"],
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("[readiness] 建人类残留卡失败")
+    # 2026-07-06 用户决议：**登录二维码是展示类，不出审批卡**（带「我已完成，继续」按钮的
+    # 审批框对纯展示是误导 UX——用户以为要审批什么）。改为直接发一条**渲染消息**（含
+    # data:image 二维码），用户扫码后回任意消息我 re-probe 继续 / 回「刷新」换一张（re-probe
+    # 复用 decide 的 _rerun_readiness_if_applicable，登录成功即过、未登录即重发 QR）。
+    # human-secret / human-tos 是**真人工门**（要用户提供密钥 / 接受条款），保留审批卡。
+    _pid = mission_id if isinstance(mission_id, uuid.UUID) else uuid.UUID(str(mission_id))
+    if requirement.get("kind") == "human-qr":
+        try:
+            from app.services import messaging_service
+            if qr_url:
+                body = (
+                    f"🔑 **{server.name}** 需要扫码登录。请用对应 App 扫描下面的二维码：\n\n"
+                    f"![登录二维码]({qr_url})\n\n"
+                    "扫码并在 App 内确认登录后，**回复任意消息**（例如「扫好了」）我就继续验证；"
+                    "二维码过期或看不清，回复「**刷新二维码**」我给你换一张。"
+                )
+            else:
+                body = (
+                    f"⚠️ **{server.name}** 需要扫码登录，但二维码暂时获取失败"
+                    f"（{qr_err or '未知原因'}）。稍后回复「**刷新二维码**」我再试一次。"
+                )
+            await messaging_service.append_message(
+                db, _pid, "main", role="agent_log", content=body,
+                meta={"kind": "readiness_qr", "server": server.name},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[readiness] 发二维码渲染消息失败")
+    else:
+        card = build_human_action_card(requirement, server_name=server.name, qr_image_url=qr_url)
+        # 幂等：同项目已有同标题的 pending 卡 → 不重复发（re-finalize / re-probe 不刷屏）
+        try:
+            from sqlalchemy import text as _text
+            dup = (await db.execute(_text(
+                "SELECT 1 FROM pending_approvals WHERE mission_id=:p AND title=:t AND status='pending' LIMIT 1"
+            ), {"p": str(_pid), "t": card["title"]})).first()
+            if dup:
+                logger.info("[readiness] 同标题 pending 卡已存在，跳过重复发：%s", card["title"])
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from app.services import pending_approval_service as pa
+            await pa.create_pending(
+                db, mission_id=_pid,
+                title=card["title"], message=card["body"], options=card["options"],
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[readiness] 建人类残留卡失败")
     # 暂停项目，等人类完成 → resume 复验
     try:
         from app.models.mission import Mission

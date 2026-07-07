@@ -154,6 +154,15 @@ async def _autostart_and_trigger(
         "paused_clarification", "paused_waiting_capability", "paused_idle",
     )
     if proj_refreshed is not None and current_lifecycle in _PAUSED_RESUMABLE:
+        # 2026-07-06 · 二维码改为无卡渲染消息后，用户回复（"扫好了" / "刷新二维码"）就是
+        # 恢复信号。RESUME 前先抓 readiness 上下文（resume 会清 paused_reason），resume 后
+        # re-probe：登录成功 → 直接过；未登录 → 重发一张新二维码消息。复用 decide 的钩子。
+        _readiness_reason = None
+        try:
+            from app.services.pending_approval_service import _readiness_reason_for
+            _readiness_reason = await _readiness_reason_for(db, mission_id)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from app.domain.lifecycle_service import LifecycleService
             from app.domain.lifecycle import LifecycleAction
@@ -165,6 +174,15 @@ async def _autostart_and_trigger(
             current_runtime = proj_refreshed.runtime_status
         except Exception:
             logger.exception("[autostart] paused→running resume failed (不阻塞)")
+        if _readiness_reason:
+            try:
+                from app.services.pending_approval_service import _rerun_readiness_if_applicable
+                await _rerun_readiness_if_applicable(db, mission_id, _readiness_reason)
+                await db.refresh(proj_refreshed)
+                current_lifecycle = proj_refreshed.lifecycle_status
+                current_runtime = proj_refreshed.runtime_status
+            except Exception:  # noqa: BLE001
+                logger.exception("[autostart] readiness re-probe on user reply failed (不阻塞)")
 
     needs_start = (
         auto_start

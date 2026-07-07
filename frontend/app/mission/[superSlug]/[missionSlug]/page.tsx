@@ -59,6 +59,7 @@ import { missionsAdminApi } from '@/lib/api/missionsAdmin';
 import { missionsApi, type MissionPublic } from '@/lib/api/missions';
 import Link from 'next/link';
 import { Dialog } from '@/components/ui/dialog';
+import { MarkdownViewer } from '@/components/ui/markdown-viewer';
 import { dispatchSSEEvent } from '@/lib/sse/handlers';
 import { assembleMissionTimeline } from '@/lib/chat/missionTimeline';
 import { storageApi } from '@/lib/api/storage';
@@ -824,10 +825,17 @@ export default function SuperWorkstation() {
                         </span>
                       )}
                     </div>
-                    <pre className="whitespace-pre-wrap break-words text-xs">
-                      {(m.content || '').slice(0, 4000)}
-                      {m.meta?._streaming && <span className="animate-pulse">▍</span>}
-                    </pre>
+                    {/* 含 data:image（如登录二维码 / MCP 图片旁路 artifact）→ 走 MarkdownViewer
+                        渲染成图（urlTransform 放行 data:image），避免 base64 当裸文本吐 + 4000 截断。
+                        其余散消息保持 <pre> 裸文本（agent_log / 系统回显不该 markdown 化）。 */}
+                    {(m.content || '').includes('data:image') ? (
+                      <MarkdownViewer content={m.content || ''} className="text-xs" />
+                    ) : (
+                      <pre className="whitespace-pre-wrap break-words text-xs">
+                        {(m.content || '').slice(0, 4000)}
+                        {m.meta?._streaming && <span className="animate-pulse">▍</span>}
+                      </pre>
+                    )}
                     {(() => {
                       // FIX A · 收集本条消息已通过 meta.artifact_url 展示的 key，避免与正文扫描重复渲染。
                       const shownKeys = new Set<string>();
